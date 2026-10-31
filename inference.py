@@ -54,6 +54,12 @@ def parser():
     p.add_argument("--context-tokens", type=int, default=16384)
     p.add_argument("--max-new-tokens", type=int, default=2048)
     p.add_argument("--thinking", action="store_true")
+    p.add_argument(
+        "--prefill-chunk-size",
+        type=int,
+        default=512,
+        help="Process prompt in chunks to reduce peak VRAM; 0 disables chunking",
+    )
     p.add_argument("--max-steps", type=int, default=16)
     p.add_argument("--limit", type=int, default=20, help="0 = all questions")
     p.add_argument(
@@ -84,6 +90,7 @@ def main():
             args.max_steps - 1,
             args.context_tokens - 1,
             args.max_new_tokens - 1,
+            args.prefill_chunk_size,
         )
         < 0
     ):
@@ -181,6 +188,7 @@ def main():
         args.max_new_tokens,
         args.thinking,
         args.gpu_memory_gib,
+        args.prefill_chunk_size,
     )
     import importlib.metadata
 
@@ -205,6 +213,8 @@ def main():
     }
     meta_path.write_text(json.dumps(meta, ensure_ascii=False, indent=2) + "\n")
     times, errors = [], 0
+    successful_times = []
+    stopped_on_error = False
     with (
         args.output.open("a", encoding="utf-8") as out,
         trace_path.open("a", encoding="utf-8") as traces,
@@ -218,6 +228,8 @@ def main():
             detail["gpu_memory"] = backend.memory()
             times.append(detail["elapsed_seconds"])
             errors += detail["status"] != "ok"
+            if detail["status"] == "ok":
+                successful_times.append(detail["elapsed_seconds"])
             traces.write(json.dumps(detail, ensure_ascii=False) + "\n")
             traces.flush()
             brief = {k: v for k, v in detail.items() if k != "trace"}
@@ -230,24 +242,38 @@ def main():
             out.flush()
             print(
                 f"[{i}/{len(pending)}] {q['id']} {detail['status']} {prediction['type']} "
-                f"{detail['elapsed_seconds']:.1f}s; remaining estimate "
-                f"{statistics.mean(times) * (len(pending) - i) / 60:.1f}min",
+                f"{detail['elapsed_seconds']:.1f}s",
                 flush=True,
             )
             if args.question:
                 print(json.dumps(prediction, ensure_ascii=False, indent=2))
+            if detail["status"] == "error":
+                stopped_on_error = True
+                print(
+                    "Stopping after model/runtime failure:", detail["error"], flush=True
+                )
+                print(f"Full traceback: {trace_path}", flush=True)
+                break
     summary = {
         "completed_this_run": len(times),
         "execution_failures": errors,
         "mean_seconds": statistics.mean(times),
         "median_seconds": statistics.median(times),
-        "estimated_3000_questions_hours": statistics.mean(times) * 3000 / 3600,
-        "estimate_note": "Rough estimate from this sample; excludes load time and varies by business/tool complexity.",
+        "stopped_on_error": stopped_on_error,
+        "selected_but_not_completed": len(pending) - len(times),
+        "estimated_3000_questions_hours": (
+            statistics.mean(successful_times) * 3000 / 3600
+            if successful_times and not errors
+            else None
+        ),
+        "estimate_note": "No extrapolation when execution fails. Otherwise a rough sample estimate excluding model load time.",
     }
     args.output.with_suffix(".summary.json").write_text(
         json.dumps(summary, ensure_ascii=False, indent=2) + "\n"
     )
     print(json.dumps(summary, ensure_ascii=False, indent=2))
+    if stopped_on_error:
+        raise SystemExit(1)
 
 
 if __name__ == "__main__":

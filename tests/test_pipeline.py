@@ -321,16 +321,122 @@ def test_explicit_model_split_uses_both_gpus_and_keeps_blocks_whole():
     from zaic.model import make_split_map
 
     prefix = "model.language_model.layers"
-    names = {prefix, "model.language_model.norm", "lm_head"}
+    names = {
+        prefix,
+        "model.language_model.norm",
+        "model.language_model.embed_tokens",
+        "lm_head",
+    }
     names.update(f"{prefix}.{i}" for i in range(32))
     mapping = make_split_map(names, 32, 2)
-    assert mapping[""] == 0
+    assert mapping["model.language_model.embed_tokens"] == 0
     assert all(mapping[f"{prefix}.{i}"] == 0 for i in range(16))
     assert all(mapping[f"{prefix}.{i}"] == 1 for i in range(16, 32))
     assert mapping["model.language_model.norm"] == 1
-    assert mapping["lm_head"] == 1
+    assert mapping["lm_head"] == 0
     assert make_split_map(names, 32, 2, tied_embeddings=True)["lm_head"] == 0
     with pytest.raises(ValueError, match="two visible GPUs"):
         make_split_map(names, 32, 1)
     with pytest.raises(ValueError, match="unique decoder"):
         make_split_map(set(), 32, 2)
+
+
+def test_generation_failure_has_traceback(source):
+    class FailingBackend:
+        def generate(self, messages):
+            raise RuntimeError("Expected all tensors to be on the same device")
+
+    pred, detail = answer_question(
+        FailingBackend(),
+        source,
+        {
+            "id": "q",
+            "business_id": "biz_1",
+            "question": "Tổng tiền?",
+            "as_of_date": "2026-01-01",
+        },
+    )
+    assert pred["type"] == "abstain"
+    assert detail["status"] == "error"
+    assert "RuntimeError" in detail["error_traceback"]
+    assert "generate" in detail["error_traceback"]
+
+
+def test_text_only_split_map_has_no_parent_fallback():
+    from zaic.model import make_split_map
+
+    names = {
+        "model.layers",
+        "model.embed_tokens",
+        "model.rotary_emb",
+        "model.norm",
+        "lm_head",
+        *(f"model.layers.{i}" for i in range(4)),
+    }
+    mapping = make_split_map(names, 4, 2)
+    assert "" not in mapping
+    assert mapping["model.embed_tokens"] == mapping["lm_head"] == 0
+    assert mapping["model.layers.2"] == mapping["model.norm"] == 1
+
+
+def test_cli_stops_on_runtime_error_without_time_extrapolation(
+    source, tmp_path, monkeypatch
+):
+    import importlib.metadata
+    import sys
+
+    import inference
+    import zaic.model
+
+    questions = [
+        {
+            "id": f"q{i}",
+            "business_id": "biz_1",
+            "question": "Tổng tiền?",
+            "as_of_date": "2026-01-01",
+        }
+        for i in range(2)
+    ]
+    (source / "questions.jsonl").write_text(
+        "".join(json.dumps(q) + "\n" for q in questions)
+    )
+
+    class BrokenBackend:
+        def __init__(self, *args):
+            self.device_map = {"model.layers.0": "0"}
+
+        def reset_peak(self):
+            pass
+
+        def memory(self):
+            return {}
+
+        def generate(self, messages):
+            raise RuntimeError("CUDA out of memory")
+
+    monkeypatch.setattr(zaic.model, "QwenBackend", BrokenBackend)
+    monkeypatch.setattr(importlib.metadata, "version", lambda package: "test")
+    output = tmp_path / "failure" / "predictions.jsonl"
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "inference.py",
+            "--data-dir",
+            str(source),
+            "--limit",
+            "2",
+            "--output",
+            str(output),
+        ],
+    )
+    with pytest.raises(SystemExit) as exc:
+        inference.main()
+    assert exc.value.code == 1
+    assert len(read_jsonl(output)) == 1
+    summary = json.loads(output.with_suffix(".summary.json").read_text())
+    assert summary["stopped_on_error"] is True
+    assert summary["selected_but_not_completed"] == 1
+    assert summary["estimated_3000_questions_hours"] is None
+    metrics = read_jsonl(output.with_suffix(".metrics.jsonl"))
+    assert "generate" in metrics[0]["error_traceback"]

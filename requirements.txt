@@ -1,6 +1,6 @@
 # Install PyTorch matching Kaggle's CUDA runtime separately if it is not preinstalled.
 torch>=2.6
-transformers>=5.2,<6
+transformers>=5.13,<6
 accelerate>=1.4,<2
 bitsandbytes>=0.45,<1
 pandas>=2.2,<4

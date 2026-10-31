@@ -21,14 +21,17 @@ def make_split_map(module_names, num_layers, gpu_count, tied_embeddings=False):
         raise ValueError("Cannot identify a unique decoder stack for this checkpoint")
     stack = candidates[0]
     parent = stack.rsplit(".", 1)[0]
-    mapping = {"": 0}
+    # Cover actual text-model modules explicitly instead of using a root-wide map.
+    mapping = {f"{parent}.embed_tokens": 0}
+    if f"{parent}.rotary_emb" in module_names:
+        mapping[f"{parent}.rotary_emb"] = 0
     for i in range(num_layers):
         mapping[f"{stack}.{i}"] = min(i * gpu_count // num_layers, gpu_count - 1)
     norm = f"{parent}.norm"
     if norm in module_names:
         mapping[norm] = gpu_count - 1
     if "lm_head" in module_names:
-        mapping["lm_head"] = 0 if tied_embeddings else gpu_count - 1
+        mapping["lm_head"] = 0
     return mapping
 
 
@@ -42,13 +45,14 @@ class QwenBackend:
         max_new_tokens=2048,
         thinking=False,
         gpu_memory_gib=13,
+        prefill_chunk_size=512,
     ):
         import torch
         from transformers import (
             AutoConfig,
             AutoTokenizer,
             BitsAndBytesConfig,
-            Qwen3_5ForConditionalGeneration,
+            Qwen3_5ForCausalLM,
         )
 
         if not torch.cuda.is_available():
@@ -58,13 +62,14 @@ class QwenBackend:
         self.max_new_tokens = max_new_tokens
         self.thinking = thinking
         self.model_id = model_id
+        self.prefill_chunk_size = prefill_chunk_size or None
+        config = AutoConfig.from_pretrained(model_id)
+        text_config = getattr(config, "text_config", config)
         if device_map == "split":
             from accelerate import init_empty_weights
 
-            config = AutoConfig.from_pretrained(model_id)
-            text_config = getattr(config, "text_config", config)
             with init_empty_weights():
-                empty = Qwen3_5ForConditionalGeneration(config)
+                empty = Qwen3_5ForCausalLM(text_config)
             names = set(dict(empty.named_modules()))
             device_map = make_split_map(
                 names,
@@ -102,9 +107,10 @@ class QwenBackend:
             )
         elif quantization == "8bit":
             kwargs["quantization_config"] = BitsAndBytesConfig(load_in_8bit=True)
-        # Explicit multimodal class matches the official checkpoint. Text prompts only.
-        self.model = Qwen3_5ForConditionalGeneration.from_pretrained(
-            model_id, **kwargs
+        # Official text-only loader maps language-model weights from the original
+        # multimodal checkpoint. Do not instantiate the unused vision tower.
+        self.model = Qwen3_5ForCausalLM.from_pretrained(
+            model_id, config=text_config, **kwargs
         ).eval()
         self.device_map = {
             str(k): str(v) for k, v in getattr(self.model, "hf_device_map", {}).items()
@@ -155,6 +161,9 @@ class QwenBackend:
                 **encoded,
                 max_new_tokens=self.max_new_tokens,
                 do_sample=False,
+                use_cache=True,
+                cache_implementation="dynamic",
+                prefill_chunk_size=self.prefill_chunk_size,
                 # Avoid allocating [prompt_length, vocabulary_size] logits at prefill.
                 logits_to_keep=1,
                 pad_token_id=self.tokenizer.eos_token_id,

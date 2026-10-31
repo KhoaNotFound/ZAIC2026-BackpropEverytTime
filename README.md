@@ -33,19 +33,19 @@ Kiểm tra chọn mẫu, chưa tải model:
 python inference.py --data-dir /kaggle/input/<dataset>/train --limit 5 --dry-run
 ```
 
-Chạy 5 câu trước để kiểm tra model và VRAM, rồi dùng đường dẫn output mới để chạy 20 câu:
+Chạy 1 câu trước để kiểm tra model và VRAM, rồi dùng đường dẫn output mới để chạy 20 câu:
 
 ```bash
 python inference.py \
   --data-dir /kaggle/input/<dataset>/train \
   --model Qwen/Qwen3.5-9B --quantization 4bit \
-  --device-map split --limit 5 --sampling stratified \
+  --device-map split --limit 1 --sampling stratified \
   --output /kaggle/working/smoke/predictions.jsonl
 ```
 
-Mặc định: `--device-map split` chia các decoder layer nguyên khối qua tất cả GPU đang thấy. Với Qwen3.5-9B và hai T4, 16 layer đầu đặt trên GPU 0 và 16 layer sau trên GPU 1; embedding ở GPU 0, norm và output head ở GPU cuối (output head ở GPU 0 nếu buộc dùng chung trọng số embedding). Chế độ này cần ít nhất hai GPU. Đây là model parallelism, không phải hai worker chạy hai câu đồng thời hoặc tensor parallelism; không đảm bảo nhanh gấp đôi.
+Mặc định: `--device-map split` chia các decoder layer nguyên khối qua tất cả GPU đang thấy. Với Qwen3.5-9B và hai T4, 16 layer đầu đặt trên GPU 0 và 16 layer sau trên GPU 1; embedding ở GPU 0, norm ở GPU cuối, output head luôn ở GPU 0 cùng input. Chế độ này cần ít nhất hai GPU. Đây là model parallelism, không phải hai worker chạy hai câu đồng thời hoặc tensor parallelism; không đảm bảo nhanh gấp đôi.
 
-Các cấu hình còn lại: FP16 compute, NF4 4-bit, context 16.384 token gồm input và output, 2.048 token đầu ra mỗi lượt, 16 lượt/câu. Chỉ tính logits của token cuối (`logits_to_keep=1`) để tránh tạo logits cho toàn bộ prompt. Code in device map và bộ nhớ từng GPU sau khi nạp; các layer được chia đều nhưng tổng VRAM có thể lệch vì embedding, head, cache và tensor tạm.
+Các cấu hình còn lại: FP16 compute, NF4 4-bit, context 16.384 token gồm input và output, 2.048 token đầu ra mỗi lượt, 16 lượt/câu. Nạp lớp text-only `Qwen3_5ForCausalLM`, bỏ vision tower không dùng. Chỉ tính logits của token cuối (`logits_to_keep=1`) và mặc định xử lý prompt theo chunk 512 token (`--prefill-chunk-size 512`, đặt 0 để tắt). Chunking không cắt bỏ prompt, nhưng cần Transformers >=5.13 để giữ đúng trạng thái hybrid attention qua các chunk. Dùng dynamic cache mới cho mỗi lần sinh. Code in device map và bộ nhớ từng GPU sau khi nạp; các layer được chia đều nhưng tổng VRAM có thể lệch vì embedding, head, cache và tensor tạm.
 
 `--device-map auto`, `balanced`, `balanced_low_0`, `sequential` vẫn được hỗ trợ. `--gpu-memory-gib 13` là ngân sách đặt trọng số cho các chế độ tự ánh xạ này, không phải hard limit tổng VRAM. Nó không áp dụng cho map `split` tường minh. `--device-map cuda:0` dùng một card. `--quantization none` dùng FP16 và cần nhiều VRAM hơn. Hybrid attention có thể dùng đường PyTorch chậm nếu không có kernel tăng tốc phù hợp; không cài FlashAttention tùy tiện trên T4.
 
@@ -54,10 +54,11 @@ Nếu dùng uv trên Kaggle, cập nhật repo rồi chạy trong cell:
 ```python
 %cd /kaggle/working/zAIC
 !git pull --ff-only
+!uv sync --upgrade-package transformers
 !uv run python inference.py --data-dir "<đường dẫn train thực tế>" --device-map split --quantization 4bit --limit 5 --output /kaggle/working/split/predictions.jsonl
 ```
 
-Dừng tiến trình inference cũ trước khi chạy; nếu model còn trong kernel notebook, restart session/kernel để giải phóng GPU. Khi đổi device map hãy dùng output mới thay vì resume đợt chạy cũ. Split giúp phân bổ trọng số nhưng vẫn có thể OOM do context dài hoặc tiến trình khác chiếm VRAM; chưa benchmark bản sửa trên T4 thật.
+Dừng tiến trình inference cũ trước khi chạy; nếu model còn trong kernel notebook, restart session/kernel để giải phóng GPU. Khi đổi device map hãy dùng output mới thay vì resume đợt chạy cũ. Split giúp phân bổ trọng số nhưng vẫn có thể OOM do context dài hoặc tiến trình khác chiếm VRAM; chưa benchmark bản sửa trên T4 thật. Nếu còn lỗi, xem `error_traceback` trong trace/metrics để xác định phép tính lỗi.
 
 
 Nếu vượt context, chương trình ghi lỗi rồi abstain, không âm thầm cắt mất rulebook. Hãy xem trace, tăng `--context-tokens` nếu VRAM cho phép, hoặc giảm độ dài tool output/chuỗi xử lý. `--thinking` bật suy luận nội bộ, có thể cần tăng `--max-new-tokens`; mặc định tắt để đo baseline nhanh hơn. Generation mặc định greedy để dễ tái lập, không phải sampling preset tối ưu của nhà phát hành.
@@ -77,7 +78,7 @@ Báo cáo: accuracy trên toàn mẫu, coverage, accuracy của câu có trả l
 
 ### Chạy tiếp / chạy toàn bộ
 
-Dùng lại chính lệnh inference ban đầu và thêm `--resume`. Cấu hình và danh sách mẫu phải giống nhau. Chỉ ID đã lưu dự đoán mới được bỏ qua. Lỗi thực thi được lưu thành abstain; để thử lại các câu lỗi, dùng một đợt chạy mới. Khi đổi limit/model/cấu hình hãy dùng output mới.
+Dùng lại chính lệnh inference ban đầu và thêm `--resume`. Cấu hình và danh sách mẫu phải giống nhau. Chỉ ID đã lưu dự đoán mới được bỏ qua. Lỗi model/runtime được lưu thành abstain kèm traceback, chương trình dừng ngay và thoát mã 1; để thử lại các câu lỗi, dùng một đợt chạy mới. Không tiếp tục dùng model sau OOM và không ngoại suy thời gian khi có lỗi thực thi. Khi đổi limit/model/cấu hình hãy dùng output mới.
 
 ```bash
 python inference.py \
@@ -104,7 +105,7 @@ python inference.py \
 - `predictions.run.json`: cấu hình, mẫu câu, phiên bản thư viện, device map, thời gian nạp model.
 - `predictions.traces.jsonl`: phản hồi model, lời gọi tool, kết quả/lỗi.
 - `predictions.metrics.jsonl`: thời gian/token/VRAM theo câu, không có toàn bộ trace.
-- `predictions.summary.json`: thống kê thời gian cho phần chạy trong session hiện tại.
+- `predictions.summary.json`: thống kê thời gian cho phần chạy trong session hiện tại; ngoại suy null nếu có lỗi thực thi.
 - `predictions.evaluation.json`: kết quả chấm.
 
 Lưu sau từng câu để tiếp tục được. Nếu tiến trình dừng giữa lúc ghi một dòng JSONL, sửa/bỏ dòng cuối không hoàn chỉnh trước khi resume; parser báo lỗi thay vì bỏ qua dữ liệu hỏng. Trace có thể chứa thông tin kinh doanh và khách hàng, cần giữ cùng phạm vi truy cập với dữ liệu nguồn.
@@ -128,7 +129,9 @@ python -m pytest -q
 ruff check zaic inference.py evaluate.py tests
 ```
 
-Đã chạy qua 12 test và Ruff tại môi trường phát triển (Python 3.13, pandas 3.1.0, DuckDB 2.0.0, OpenPyXL 3.1.5).
+Đã chạy qua 15 test CPU; một test GPU được skip khi không có PyTorch/hai GPU CUDA. Ruff đã qua. Test GPU nhỏ không tải checkpoint, so generation single-GPU với split + chunked prefill: `uv run pytest -q tests/test_gpu_smoke.py`.
+
+Các kiểm tra dữ liệu ban đầu được thực hiện tại môi trường phát triển (Python 3.13, pandas 3.1.0, DuckDB 2.0.0, OpenPyXL 3.1.5).
 
 Các test dùng nguồn giả lập và model phản hồi theo kịch bản để kiểm tra đầy đủ vòng lặp → tool → đáp án → chấm, file isolation, SQL read-only, alias, danh sách/bảng, lấy mẫu và format. Không thay thế kiểm thử Qwen thật trên Kaggle.
 
@@ -138,6 +141,8 @@ Các test dùng nguồn giả lập và model phản hồi theo kịch bản đ�
 - [Transformers Qwen3.5](https://huggingface.co/docs/transformers/model_doc/qwen3_5)
 - [BitsAndBytes](https://huggingface.co/docs/transformers/quantization/bitsandbytes)
 
-Python >=3.10, cần Transformers hỗ trợ `Qwen3_5ForConditionalGeneration`. Sau khi chạy thành công trên Kaggle, lưu `pip freeze` cùng notebook để khóa môi trường đã kiểm chứng.
+Python >=3.10, cần Transformers >=5.13 hỗ trợ `Qwen3_5ForCausalLM` và chunked prefill của hybrid attention. Sau khi chạy thành công trên Kaggle, lưu `pip freeze` cùng notebook để khóa môi trường đã kiểm chứng.
 
 Chiến lược device map tham khảo: [Accelerate Big Model Inference](https://huggingface.co/docs/accelerate/concept_guides/big_model_inference).
+
+Chunked prefill: [Transformers generation](https://huggingface.co/docs/transformers/main_classes/text_generation). Text-only Qwen loader: [Qwen3.5 docs](https://huggingface.co/docs/transformers/v5.13.0/model_doc/qwen3_5).

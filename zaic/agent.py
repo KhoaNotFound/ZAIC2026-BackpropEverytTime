@@ -1,4 +1,5 @@
 import time
+import traceback
 
 from .formats import parse_action, valid_answer
 from .tools import TOOL_HELP, Tools, encode
@@ -27,7 +28,7 @@ def answer_question(backend, split_dir, question, max_steps=16, tool_chars=10000
     start = time.perf_counter()
     tools = Tools(split_dir, question["business_id"])
     trace, usages = [], []
-    status, error = "ok", None
+    status, error, error_traceback = "ok", None, None
     prediction = {"id": question["id"], "type": "abstain"}
     messages = [
         {"role": "system", "content": SYSTEM + "\n" + TOOL_HELP},
@@ -100,6 +101,7 @@ def answer_question(backend, split_dir, question, max_steps=16, tool_chars=10000
             status, error = "max_steps", "Agent exhausted tool/action budget"
     except Exception as exc:  # noqa: BLE001 -- capture tool/model failures for retry and checkpoints
         status, error = "error", f"{type(exc).__name__}: {exc}"
+        error_traceback = traceback.format_exc()
     finally:
         tools.close()
     return prediction, {
@@ -107,6 +109,7 @@ def answer_question(backend, split_dir, question, max_steps=16, tool_chars=10000
         "business_id": question["business_id"],
         "status": status,
         "error": error,
+        "error_traceback": error_traceback,
         "elapsed_seconds": time.perf_counter() - start,
         "steps": len(trace),
         "tool_calls": sum("tool_result" in t or "tool_error" in t for t in trace),
