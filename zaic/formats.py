@@ -79,3 +79,47 @@ def parse_action(text):
     if not isinstance(action, dict):
         raise TypeError("Expected one JSON object")
     return action
+
+
+TOOL_NAMES = frozenset(
+    {
+        "list_files",
+        "read_document",
+        "inspect_table",
+        "load_table",
+        "run_sql",
+        "query_sqlite",
+    }
+)
+
+
+def normalize_action(action):
+    """Accept only known tools in wrapped or flat JSON, without guessing arguments."""
+    kind = action.get("action")
+    if kind == "final":
+        return action
+    if kind == "tool":
+        name = action.get("name")
+        arguments = action.get("arguments", {})
+        if set(action) - {"action", "name", "arguments"}:
+            raise ValueError("Put tool parameters inside arguments")
+    elif isinstance(kind, str) and kind in TOOL_NAMES:
+        name = kind
+        if "arguments" in action:
+            if set(action) - {"action", "arguments"}:
+                raise ValueError("Use either flat parameters or arguments, not both")
+            arguments = action["arguments"]
+        else:
+            # name is the destination table name for load_table, not the tool name.
+            arguments = {k: v for k, v in action.items() if k != "action"}
+    else:
+        raise ValueError("Unknown action; choose a documented tool or final")
+    if not isinstance(name, str) or name not in TOOL_NAMES:
+        raise ValueError("Unknown tool")
+    if not isinstance(arguments, dict):
+        raise TypeError("arguments must be an object")
+    arguments = dict(arguments)
+    if name == "list_files":
+        # Listing is always scoped to the current business. A path cannot broaden it.
+        arguments.pop("path", None)
+    return {"action": "tool", "name": name, "arguments": arguments}

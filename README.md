@@ -117,7 +117,7 @@ Lưu sau từng câu để tiếp tục được. Nếu tiến trình dừng gi�
 - `run_sql`: DuckDB SELECT trên bảng đã nạp, chặn truy cập file/network ngoài.
 - `query_sqlite`: kết nối read-only, authorizer chỉ cho đọc, có timeout.
 
-Đường dẫn được giới hạn trong shop hiện tại, cộng `rulebook.md`/`calendar.csv` của split. Agent không có tool đọc JSONL hoặc đáp án. Chỉ bộ chấm đọc `answers.jsonl`. Công cụ trả tối đa 100 dòng, không giới hạn phạm vi tính tổng; kết quả lớn được báo truncated. Model dùng **giao thức action JSON tự định nghĩa**, không phải parser native tool-call của Qwen. Có retry sửa lỗi protocol trong giới hạn lượt.
+Đường dẫn được giới hạn trong shop hiện tại, cộng `rulebook.md`/`calendar.csv` của split. Agent không có tool đọc JSONL hoặc đáp án. Chỉ bộ chấm đọc `answers.jsonl`. Công cụ trả tối đa 100 dòng, không giới hạn phạm vi tính tổng; kết quả lớn được báo truncated. Model dùng **giao thức action JSON tự định nghĩa**, không phải parser native tool-call của Qwen. Nhận cả dạng bọc `{"action":"tool","name":"load_table","arguments":{...}}` lẫn dạng phẳng `{"action":"load_table","path":"...","name":"sales"}`; chỉ tên tool trong whitelist được nhận. Với `list_files`, path dư được bỏ qua vì tool luôn giới hạn ở shop hiện tại. Trace giữ phản hồi gốc và `normalized_action`. Có ví dụ gọi tool với tên file nguồn thực tế và retry sửa lỗi protocol. Ba lời gọi giống hệt liên tiếp hoặc ba phản hồi lỗi giống hệt dẫn đến `stalled`/abstain, không chạy hết lượt một cách vô ích.
 
 Chưa cung cấp thực thi Python tùy ý; các phép chuẩn hóa dùng SQL và tham số đọc bảng. Một số shop đặc thù có thể cần bổ sung tool có hàm xử lý xác định. Hiện giới hạn thời gian áp dụng cho truy vấn SQL; nạp workbook và generation chỉ bị giới hạn bởi tài nguyên, context và số token, chưa có hard timeout cho cả câu.
 
@@ -129,7 +129,7 @@ python -m pytest -q
 ruff check zaic inference.py evaluate.py tests
 ```
 
-Đã chạy qua 15 test CPU; một test GPU được skip khi không có PyTorch/hai GPU CUDA. Ruff đã qua. Test GPU nhỏ không tải checkpoint, so generation single-GPU với split + chunked prefill: `uv run pytest -q tests/test_gpu_smoke.py`.
+Đã chạy qua 25 test CPU; một test GPU được skip khi không có PyTorch/hai GPU CUDA. Ruff đã qua. Test GPU nhỏ không tải checkpoint, so generation single-GPU với split + chunked prefill: `uv run pytest -q tests/test_gpu_smoke.py`.
 
 Các kiểm tra dữ liệu ban đầu được thực hiện tại môi trường phát triển (Python 3.13, pandas 3.1.0, DuckDB 2.0.0, OpenPyXL 3.1.5).
 

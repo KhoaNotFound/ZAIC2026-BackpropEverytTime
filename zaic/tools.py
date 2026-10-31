@@ -10,6 +10,8 @@ import time
 from contextlib import closing
 from pathlib import Path
 
+from .formats import TOOL_NAMES
+
 TOOL_HELP = """Tools (one call per turn):
 list_files {} -> paths relative to current business directory.
 read_document {"path":"README.md","offset":0,"limit":12000} -> text; rulebook.md is split rulebook.
@@ -70,14 +72,7 @@ class Tools:
         return p
 
     def call(self, name, args):
-        if name not in {
-            "list_files",
-            "read_document",
-            "inspect_table",
-            "load_table",
-            "run_sql",
-            "query_sqlite",
-        }:
+        if name not in TOOL_NAMES:
             raise ValueError("Unknown tool")
         if not isinstance(args, dict):
             raise TypeError("arguments must be an object")

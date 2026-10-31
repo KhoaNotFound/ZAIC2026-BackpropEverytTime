@@ -440,3 +440,107 @@ def test_cli_stops_on_runtime_error_without_time_extrapolation(
     assert summary["estimated_3000_questions_hours"] is None
     metrics = read_jsonl(output.with_suffix(".metrics.jsonl"))
     assert "generate" in metrics[0]["error_traceback"]
+
+
+@pytest.mark.parametrize(
+    "raw, expected",
+    [
+        (
+            {
+                "action": "load_table",
+                "path": "sales.csv",
+                "name": "DanhSachHoaDon",
+                "header_row": 0,
+            },
+            {
+                "action": "tool",
+                "name": "load_table",
+                "arguments": {
+                    "path": "sales.csv",
+                    "name": "DanhSachHoaDon",
+                    "header_row": 0,
+                },
+            },
+        ),
+        (
+            {"action": "list_files", "path": "DanhSachHoaDon.xlsx"},
+            {"action": "tool", "name": "list_files", "arguments": {}},
+        ),
+        (
+            {"action": "run_sql", "arguments": {"sql": "select 1"}},
+            {"action": "tool", "name": "run_sql", "arguments": {"sql": "select 1"}},
+        ),
+    ],
+)
+def test_normalize_observed_qwen_calls(raw, expected):
+    from zaic.formats import normalize_action
+
+    assert normalize_action(raw) == expected
+    assert normalize_action(expected) == expected
+
+
+@pytest.mark.parametrize(
+    "action",
+    [
+        {"action": "exec", "code": "print(1)"},
+        {"action": "tool", "name": "run_python", "arguments": {}},
+        {
+            "action": "load_table",
+            "arguments": {"path": "sales.csv"},
+            "name": "conflicting",
+        },
+        {"action": "run_sql", "arguments": "SELECT 1"},
+    ],
+)
+def test_normalization_rejects_unknown_or_ambiguous_actions(action):
+    from zaic.formats import normalize_action
+
+    with pytest.raises((ValueError, TypeError)):
+        normalize_action(action)
+
+
+def test_flat_calls_execute_tools_and_return_answer(source):
+    backend = ScriptedBackend(
+        [
+            '{"action":"load_table","path":"sales.csv","name":"DanhSachHoaDon","header_row":0}',
+            '{"action":"list_files","path":"DanhSachHoaDon.xlsx"}',
+            '{"action":"run_sql","sql":"SELECT SUM(CAST(amount AS INTEGER)) FROM DanhSachHoaDon WHERE status=\'done\'"}',
+            '{"action":"final","type":"number","answer":300}',
+        ]
+    )
+    prediction, detail = answer_question(
+        backend,
+        source,
+        {
+            "id": "q",
+            "business_id": "biz_1",
+            "question": "Tổng tiền?",
+            "as_of_date": "2026-01-01",
+        },
+    )
+    assert prediction["answer"] == 300
+    assert detail["status"] == "ok"
+    assert all("tool_error" not in step for step in detail["trace"])
+    assert (
+        detail["trace"][0]["normalized_action"]["arguments"]["name"] == "DanhSachHoaDon"
+    )
+    assert detail["trace"][1]["normalized_action"]["arguments"] == {}
+    assert "SECRET LABEL" not in "".join(backend.prompts)
+
+
+def test_agent_stops_repeated_listing_instead_of_using_all_steps(source):
+    backend = ScriptedBackend(['{"action":"list_files","path":"nonexistent.xlsx"}'] * 3)
+    prediction, detail = answer_question(
+        backend, source, {"id": "q", "business_id": "biz_1"}
+    )
+    assert prediction["type"] == "abstain"
+    assert detail["status"] == "stalled"
+    assert detail["steps"] == 3
+    assert "three times" in detail["error"]
+
+
+def test_agent_stops_identical_protocol_errors(source):
+    backend = ScriptedBackend(["not json"] * 3)
+    _, detail = answer_question(backend, source, {"id": "q", "business_id": "biz_1"})
+    assert detail["status"] == "stalled"
+    assert detail["steps"] == 3
