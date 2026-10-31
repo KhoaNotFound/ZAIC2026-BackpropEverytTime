@@ -315,3 +315,22 @@ def test_cli_checkpoint_resume_and_evaluation(source, tmp_path, monkeypatch):
         ]
         == 1
     )
+
+
+def test_explicit_model_split_uses_both_gpus_and_keeps_blocks_whole():
+    from zaic.model import make_split_map
+
+    prefix = "model.language_model.layers"
+    names = {prefix, "model.language_model.norm", "lm_head"}
+    names.update(f"{prefix}.{i}" for i in range(32))
+    mapping = make_split_map(names, 32, 2)
+    assert mapping[""] == 0
+    assert all(mapping[f"{prefix}.{i}"] == 0 for i in range(16))
+    assert all(mapping[f"{prefix}.{i}"] == 1 for i in range(16, 32))
+    assert mapping["model.language_model.norm"] == 1
+    assert mapping["lm_head"] == 1
+    assert make_split_map(names, 32, 2, tied_embeddings=True)["lm_head"] == 0
+    with pytest.raises(ValueError, match="two visible GPUs"):
+        make_split_map(names, 32, 1)
+    with pytest.raises(ValueError, match="unique decoder"):
+        make_split_map(set(), 32, 2)

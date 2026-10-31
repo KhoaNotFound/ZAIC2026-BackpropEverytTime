@@ -45,7 +45,11 @@ def parser():
     )
     p.add_argument("--model", default="Qwen/Qwen3.5-9B")
     p.add_argument("--quantization", choices=["4bit", "8bit", "none"], default="4bit")
-    p.add_argument("--device-map", default="auto", help="auto or cuda:0 to use one T4")
+    p.add_argument(
+        "--device-map",
+        default="split",
+        help="split: explicit decoder-layer partition across >=2 GPUs; auto/balanced: library placement; cuda:0: one GPU",
+    )
     p.add_argument("--gpu-memory-gib", type=int, default=13)
     p.add_argument("--context-tokens", type=int, default=16384)
     p.add_argument("--max-new-tokens", type=int, default=2048)

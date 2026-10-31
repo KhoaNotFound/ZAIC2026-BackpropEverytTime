@@ -39,11 +39,26 @@ Chạy 5 câu trước để kiểm tra model và VRAM, rồi dùng đường d�
 python inference.py \
   --data-dir /kaggle/input/<dataset>/train \
   --model Qwen/Qwen3.5-9B --quantization 4bit \
-  --device-map auto --limit 5 --sampling stratified \
+  --device-map split --limit 5 --sampling stratified \
   --output /kaggle/working/smoke/predictions.jsonl
 ```
 
-Mặc định: FP16 compute, NF4 4-bit, tối đa 13 GiB mỗi GPU khi dùng `auto`, context 16.384 token gồm input và output, 2.048 token đầu ra mỗi lượt, 16 lượt/câu. `auto` có thể chia model giữa hai T4; không phải một GPU 32 GB và không đảm bảo tăng tốc. Có thể thử `--device-map cuda:0` nếu model vừa một card; `--quantization none` dùng FP16 và thường cần chia model hai card. Chưa benchmark cấu hình này trên T4; cần kiểm tra trước khi chạy dài. Hybrid attention có thể dùng đường PyTorch chậm nếu không có kernel tăng tốc phù hợp; không cài FlashAttention tùy tiện trên T4.
+Mặc định: `--device-map split` chia các decoder layer nguyên khối qua tất cả GPU đang thấy. Với Qwen3.5-9B và hai T4, 16 layer đầu đặt trên GPU 0 và 16 layer sau trên GPU 1; embedding ở GPU 0, norm và output head ở GPU cuối (output head ở GPU 0 nếu buộc dùng chung trọng số embedding). Chế độ này cần ít nhất hai GPU. Đây là model parallelism, không phải hai worker chạy hai câu đồng thời hoặc tensor parallelism; không đảm bảo nhanh gấp đôi.
+
+Các cấu hình còn lại: FP16 compute, NF4 4-bit, context 16.384 token gồm input và output, 2.048 token đầu ra mỗi lượt, 16 lượt/câu. Chỉ tính logits của token cuối (`logits_to_keep=1`) để tránh tạo logits cho toàn bộ prompt. Code in device map và bộ nhớ từng GPU sau khi nạp; các layer được chia đều nhưng tổng VRAM có thể lệch vì embedding, head, cache và tensor tạm.
+
+`--device-map auto`, `balanced`, `balanced_low_0`, `sequential` vẫn được hỗ trợ. `--gpu-memory-gib 13` là ngân sách đặt trọng số cho các chế độ tự ánh xạ này, không phải hard limit tổng VRAM. Nó không áp dụng cho map `split` tường minh. `--device-map cuda:0` dùng một card. `--quantization none` dùng FP16 và cần nhiều VRAM hơn. Hybrid attention có thể dùng đường PyTorch chậm nếu không có kernel tăng tốc phù hợp; không cài FlashAttention tùy tiện trên T4.
+
+Nếu dùng uv trên Kaggle, cập nhật repo rồi chạy trong cell:
+
+```python
+%cd /kaggle/working/zAIC
+!git pull --ff-only
+!uv run python inference.py --data-dir "<đường dẫn train thực tế>" --device-map split --quantization 4bit --limit 5 --output /kaggle/working/split/predictions.jsonl
+```
+
+Dừng tiến trình inference cũ trước khi chạy; nếu model còn trong kernel notebook, restart session/kernel để giải phóng GPU. Khi đổi device map hãy dùng output mới thay vì resume đợt chạy cũ. Split giúp phân bổ trọng số nhưng vẫn có thể OOM do context dài hoặc tiến trình khác chiếm VRAM; chưa benchmark bản sửa trên T4 thật.
+
 
 Nếu vượt context, chương trình ghi lỗi rồi abstain, không âm thầm cắt mất rulebook. Hãy xem trace, tăng `--context-tokens` nếu VRAM cho phép, hoặc giảm độ dài tool output/chuỗi xử lý. `--thinking` bật suy luận nội bộ, có thể cần tăng `--max-new-tokens`; mặc định tắt để đo baseline nhanh hơn. Generation mặc định greedy để dễ tái lập, không phải sampling preset tối ưu của nhà phát hành.
 
@@ -113,7 +128,7 @@ python -m pytest -q
 ruff check zaic inference.py evaluate.py tests
 ```
 
-Đã chạy qua 11 test và Ruff tại môi trường phát triển (Python 3.13, pandas 3.1.0, DuckDB 2.0.0, OpenPyXL 3.1.5).
+Đã chạy qua 12 test và Ruff tại môi trường phát triển (Python 3.13, pandas 3.1.0, DuckDB 2.0.0, OpenPyXL 3.1.5).
 
 Các test dùng nguồn giả lập và model phản hồi theo kịch bản để kiểm tra đầy đủ vòng lặp → tool → đáp án → chấm, file isolation, SQL read-only, alias, danh sách/bảng, lấy mẫu và format. Không thay thế kiểm thử Qwen thật trên Kaggle.
 
@@ -124,3 +139,5 @@ Các test dùng nguồn giả lập và model phản hồi theo kịch bản đ�
 - [BitsAndBytes](https://huggingface.co/docs/transformers/quantization/bitsandbytes)
 
 Python >=3.10, cần Transformers hỗ trợ `Qwen3_5ForConditionalGeneration`. Sau khi chạy thành công trên Kaggle, lưu `pip freeze` cùng notebook để khóa môi trường đã kiểm chứng.
+
+Chiến lược device map tham khảo: [Accelerate Big Model Inference](https://huggingface.co/docs/accelerate/concept_guides/big_model_inference).

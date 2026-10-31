@@ -3,12 +3,41 @@
 import time
 
 
+def make_split_map(module_names, num_layers, gpu_count, tied_embeddings=False):
+    """Place whole decoder blocks contiguously across GPUs, never split a block."""
+    if gpu_count < 2:
+        raise ValueError(
+            "split requires at least two visible GPUs; use --device-map auto for one GPU"
+        )
+    if gpu_count > num_layers:
+        raise ValueError("More GPUs than decoder layers")
+    candidates = [
+        name
+        for name in module_names
+        if name.endswith(".layers")
+        and all(f"{name}.{i}" in module_names for i in range(num_layers))
+    ]
+    if len(candidates) != 1:
+        raise ValueError("Cannot identify a unique decoder stack for this checkpoint")
+    stack = candidates[0]
+    parent = stack.rsplit(".", 1)[0]
+    mapping = {"": 0}
+    for i in range(num_layers):
+        mapping[f"{stack}.{i}"] = min(i * gpu_count // num_layers, gpu_count - 1)
+    norm = f"{parent}.norm"
+    if norm in module_names:
+        mapping[norm] = gpu_count - 1
+    if "lm_head" in module_names:
+        mapping["lm_head"] = 0 if tied_embeddings else gpu_count - 1
+    return mapping
+
+
 class QwenBackend:
     def __init__(
         self,
         model_id,
         quantization="4bit",
-        device_map="auto",
+        device_map="split",
         context_tokens=16384,
         max_new_tokens=2048,
         thinking=False,
@@ -16,6 +45,7 @@ class QwenBackend:
     ):
         import torch
         from transformers import (
+            AutoConfig,
             AutoTokenizer,
             BitsAndBytesConfig,
             Qwen3_5ForConditionalGeneration,
@@ -28,6 +58,24 @@ class QwenBackend:
         self.max_new_tokens = max_new_tokens
         self.thinking = thinking
         self.model_id = model_id
+        if device_map == "split":
+            from accelerate import init_empty_weights
+
+            config = AutoConfig.from_pretrained(model_id)
+            text_config = getattr(config, "text_config", config)
+            with init_empty_weights():
+                empty = Qwen3_5ForConditionalGeneration(config)
+            names = set(dict(empty.named_modules()))
+            device_map = make_split_map(
+                names,
+                text_config.num_hidden_layers,
+                torch.cuda.device_count(),
+                bool(
+                    getattr(config, "tie_word_embeddings", False)
+                    or getattr(text_config, "tie_word_embeddings", False)
+                ),
+            )
+            del empty
         self.tokenizer = AutoTokenizer.from_pretrained(model_id, padding_side="left")
         kwargs = {
             "device_map": device_map,
@@ -35,7 +83,12 @@ class QwenBackend:
             "attn_implementation": "sdpa",
             "low_cpu_mem_usage": True,
         }
-        if device_map == "auto":
+        if isinstance(device_map, str) and device_map in {
+            "auto",
+            "balanced",
+            "balanced_low_0",
+            "sequential",
+        }:
             kwargs["max_memory"] = {
                 i: f"{gpu_memory_gib}GiB" for i in range(torch.cuda.device_count())
             }
@@ -56,6 +109,15 @@ class QwenBackend:
         self.device_map = {
             str(k): str(v) for k, v in getattr(self.model, "hf_device_map", {}).items()
         }
+        print("Model device map:", self.device_map, flush=True)
+        print(
+            "GPU memory after loading (GiB):",
+            {
+                i: round(torch.cuda.memory_allocated(i) / 2**30, 2)
+                for i in range(torch.cuda.device_count())
+            },
+            flush=True,
+        )
         self.reset_peak()
 
     def reset_peak(self):
@@ -93,6 +155,8 @@ class QwenBackend:
                 **encoded,
                 max_new_tokens=self.max_new_tokens,
                 do_sample=False,
+                # Avoid allocating [prompt_length, vocabulary_size] logits at prefill.
+                logits_to_keep=1,
                 pad_token_id=self.tokenizer.eos_token_id,
             )
         generated = output[0, input_tokens:]
