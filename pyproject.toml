@@ -1,0 +1,22 @@
+[project]
+name = "zaic"
+version = "0.1.0"
+description = "Qwen3.5 tool-using inference and evaluation for DataMate"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "torch>=2.6",
+    "transformers>=5.2,<6",
+    "accelerate>=1.4,<2",
+    "bitsandbytes>=0.45,<1",
+    "pandas>=2.2,<4",
+    "openpyxl>=3.1,<4",
+    "duckdb>=1.2,<3",
+]
+
+[dependency-groups]
+dev = ["pytest>=8", "ruff>=0.11"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]

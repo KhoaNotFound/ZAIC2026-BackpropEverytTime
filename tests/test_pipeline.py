@@ -1,0 +1,317 @@
+import json
+import sqlite3
+
+import pytest
+
+from evaluate import correct, score
+from inference import select_questions
+from zaic.agent import answer_question
+from zaic.formats import parse_action, read_jsonl, valid_answer
+from zaic.tools import Tools
+
+
+@pytest.fixture
+def source(tmp_path):
+    root = tmp_path / "train"
+    shop = root / "data" / "biz_1"
+    shop.mkdir(parents=True)
+    (root / "rulebook.md").write_text("Exclude canceled orders.")
+    (root / "answers.jsonl").write_text("SECRET LABEL")
+    (root / "calendar.csv").write_text("date,weekday\n2026-01-01,4\n")
+    (shop / "README.md").write_text("Each row is one order.")
+    (shop / "sales.csv").write_text(
+        "id,status,amount\n1,done,100\n2,cancelled,900\n3,done,200\n"
+    )
+    with sqlite3.connect(shop / "pos.sqlite") as db:
+        db.execute("create table sales(id integer, amount integer)")
+        db.executemany("insert into sales values (?,?)", [(1, 100), (2, 200)])
+    return root
+
+
+def test_tools_full_aggregation_and_isolation(source):
+    import duckdb
+
+    tools = Tools(source, "biz_1")
+    try:
+        assert tools.load_table("sales.csv", "sales")["rows"] == 3
+        assert (
+            tools.run_sql(
+                "select sum(cast(amount as decimal(18,0))) from sales where status='done'"
+            )["rows"][0][0]
+            == 300
+        )
+        assert tools.query_sqlite("pos.sqlite", "select sum(amount) from sales")[
+            "rows"
+        ] == [(300,)]
+        for path in [
+            "../../answers.jsonl",
+            str(source / "answers.jsonl"),
+            "answers.jsonl",
+        ]:
+            with pytest.raises(ValueError):
+                tools.resolve(path)
+        with pytest.raises((ValueError, duckdb.Error)):
+            tools.run_sql(f"select * from read_csv('{source}/answers.jsonl')")
+        for sql in [
+            "drop table sales",
+            "select 1; select 2",
+            "attach ':memory:' as other",
+        ]:
+            with pytest.raises((ValueError, duckdb.Error)):
+                tools.run_sql(sql)
+        for sql in [
+            "delete from sales",
+            "attach ':memory:' as other",
+            "select load_extension('foo')",
+        ]:
+            with pytest.raises(sqlite3.DatabaseError):
+                tools.query_sqlite("pos.sqlite", sql)
+        link = tools.root / "outside.csv"
+        link.symlink_to(source / "calendar.csv")
+        with pytest.raises(ValueError):
+            tools.resolve("outside.csv")
+    finally:
+        tools.close()
+
+
+def test_excel_raw_header_selection(source):
+    import openpyxl
+
+    wb = openpyxl.Workbook()
+    sheet = wb.active
+    sheet.title = "Tháng 1"
+    sheet.append(["Báo cáo"])
+    sheet.append(["Mã", "Tiền"])
+    sheet.append(["A", 125])
+    wb.save(source / "data/biz_1/sales.xlsx")
+    tools = Tools(source, "biz_1")
+    try:
+        assert tools.inspect_table("sales.xlsx")[0]["preview"][0][0] == "Báo cáo"
+        result = tools.load_table("sales.xlsx", "sales", sheet="Tháng 1", header_row=1)
+        assert result["columns"] == ["Mã", "Tiền"]
+        assert (
+            tools.run_sql('select sum(cast("Tiền" as integer)) from sales')["rows"][0][
+                0
+            ]
+            == 125
+        )
+    finally:
+        tools.close()
+
+
+def test_strict_numbers_and_formats():
+    gold = {"type": "number", "answer": 1_000_000_000}
+    assert correct({"type": "number", "answer": 1_000_000_000}, gold)
+    assert not correct({"type": "number", "answer": 1_000_000_001}, gold)
+    assert not correct(
+        {"type": "number", "answer": 10**18 + 1}, {"type": "number", "answer": 10**18}
+    )
+    assert not correct({"type": "number", "answer": "1000000000"}, gold)
+    assert not correct(
+        {"type": "number", "answer": True}, {"type": "number", "answer": 1}
+    )
+    assert not valid_answer({"type": "number", "answer": float("nan")})
+    assert not valid_answer({"type": "date", "answer": "2026-02-30"})
+    assert not valid_answer({"type": "unanswerable"})
+    assert not correct(
+        {"type": "percent", "answer": 0.124}, {"type": "percent", "answer": 12.4}
+    )
+
+
+def test_aliases_accents_and_list_order():
+    gold = {"type": "string", "answer": "Cà phê sữa (M)", "alias": ["SP0003"]}
+    assert correct({"type": "string", "answer": " CÀ PHÊ SỮA M "}, gold)
+    assert correct({"type": "string", "answer": "sp0003"}, gold)
+    assert not correct({"type": "string", "answer": "Ca phe sua M"}, gold)
+    gold = {"type": "list", "answer": ["A", "B"], "alias": [["SP1"], ["SP2"]]}
+    assert correct({"type": "list", "answer": ["SP1", "SP2"]}, gold)
+    assert not correct({"type": "list", "answer": ["B", "A"]}, gold)
+
+
+def test_table_rows_and_column_mapping():
+    gold = {
+        "type": "table",
+        "answer": {"columns": ["customer", "debt"], "rows": [["An", 10], ["Bình", 20]]},
+        "alias": [["KH1"], ["KH2"]],
+    }
+    assert correct(
+        {
+            "type": "table",
+            "answer": {
+                "columns": ["debt", "customer"],
+                "rows": [[20, "KH2"], [10, "KH1"]],
+            },
+        },
+        gold,
+    )
+    assert not correct(
+        {
+            "type": "table",
+            "answer": {
+                "columns": ["customer", "debt"],
+                "rows": [["KH1", 10], ["KH1", 10]],
+            },
+        },
+        gold,
+    )
+
+
+def test_score_scope_and_abstention():
+    answers = [{"id": str(i), "type": "number", "answer": i} for i in range(3)]
+    predictions = [
+        {"id": "0", "type": "number", "answer": 0},
+        {"id": "1", "type": "number", "answer": 99},
+    ]
+    report = score(predictions, answers)
+    assert report["overall"]["score"] == 0
+    assert report["overall"]["abstained"] == 1
+    assert report["overall"]["accuracy"] == pytest.approx(1 / 3)
+    with pytest.raises(ValueError):
+        score([{"id": "unknown"}], answers)
+
+
+def test_sampling_reproducible():
+    questions = [
+        {"id": f"{b}_{i}", "business_id": b} for b in ["a", "b", "c"] for i in range(4)
+    ]
+    selected = select_questions(questions, 3, 42, "stratified")
+    assert len({q["business_id"] for q in selected}) == 3
+    assert selected == select_questions(questions, 3, 42, "stratified")
+    assert len(select_questions(questions, 0, 42, "stratified")) == 12
+
+
+class ScriptedBackend:
+    def __init__(self, actions):
+        self.actions = iter(actions)
+        self.prompts = []
+
+    def generate(self, messages):
+        self.prompts.append(json.dumps(messages))
+        return next(self.actions), {"input_tokens": 10, "output_tokens": 5}
+
+
+def test_agent_end_to_end_without_gold(source):
+    backend = ScriptedBackend(
+        [
+            json.dumps(
+                {
+                    "action": "tool",
+                    "name": "query_sqlite",
+                    "arguments": {
+                        "path": "pos.sqlite",
+                        "sql": "select sum(amount) from sales",
+                    },
+                }
+            ),
+            '{"action":"final","type":"number","answer":300}',
+        ]
+    )
+    pred, trace = answer_question(
+        backend,
+        source,
+        {
+            "id": "q1",
+            "business_id": "biz_1",
+            "question": "Tổng tiền?",
+            "as_of_date": "2026-01-01",
+        },
+    )
+    assert pred == {"id": "q1", "type": "number", "answer": 300}
+    assert trace["status"] == "ok"
+    assert "SECRET LABEL" not in "".join(backend.prompts)
+
+
+def test_agent_repairs_errors_and_exhaustion(source):
+    backend = ScriptedBackend(["not json", '{"action":"final","type":"abstain"}'])
+    pred, detail = answer_question(
+        backend, source, {"id": "q", "business_id": "biz_1"}, max_steps=2
+    )
+    assert pred["type"] == "abstain" and detail["status"] == "ok"
+    assert "tool_error" in detail["trace"][0]
+    backend = ScriptedBackend(["not json"])
+    pred, detail = answer_question(
+        backend, source, {"id": "q", "business_id": "biz_1"}, max_steps=1
+    )
+    assert detail["status"] == "max_steps" and pred["type"] == "abstain"
+
+
+def test_parse_and_duplicate_ids(tmp_path):
+    assert parse_action('```json\n{"action":"final"}\n```')["action"] == "final"
+    assert (
+        parse_action('<think>reasoning</think>{"action":"final"}')["action"] == "final"
+    )
+    path = tmp_path / "duplicate.jsonl"
+    path.write_text('{"id":"a"}\n{"id":"a"}\n')
+    with pytest.raises(ValueError):
+        read_jsonl(path)
+
+
+def test_cli_checkpoint_resume_and_evaluation(source, tmp_path, monkeypatch):
+    import importlib.metadata
+    import sys
+
+    import evaluate
+    import inference
+    import zaic.model
+
+    q = {
+        "id": "q1",
+        "business_id": "biz_1",
+        "question": "Tổng tiền?",
+        "as_of_date": "2026-01-01",
+    }
+    (source / "questions.jsonl").write_text(json.dumps(q) + "\n")
+    (source / "answers.jsonl").write_text('{"id":"q1","type":"number","answer":300}\n')
+
+    class FakeBackend(ScriptedBackend):
+        def __init__(self, *args):
+            self.device_map = {"": "cpu"}
+            super().__init__(
+                [
+                    '{"action":"tool","name":"query_sqlite","arguments":{"path":"pos.sqlite","sql":"select sum(amount) from sales"}}',
+                    '{"action":"final","type":"number","answer":300}',
+                ]
+            )
+
+        def reset_peak(self):
+            pass
+
+        def memory(self):
+            return {}
+
+    monkeypatch.setattr(zaic.model, "QwenBackend", FakeBackend)
+    monkeypatch.setattr(importlib.metadata, "version", lambda package: "test")
+    output = tmp_path / "out" / "predictions.jsonl"
+    argv = [
+        "inference.py",
+        "--data-dir",
+        str(source),
+        "--limit",
+        "1",
+        "--output",
+        str(output),
+    ]
+    monkeypatch.setattr(sys, "argv", argv)
+    inference.main()
+    assert read_jsonl(output)[0]["answer"] == 300
+    monkeypatch.setattr(sys, "argv", argv + ["--resume"])
+    inference.main()
+    assert len(read_jsonl(output)) == 1
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "evaluate.py",
+            "--predictions",
+            str(output),
+            "--answers",
+            str(source / "answers.jsonl"),
+        ],
+    )
+    evaluate.main()
+    assert (
+        json.loads(output.with_suffix(".evaluation.json").read_text())["overall"][
+            "accuracy"
+        ]
+        == 1
+    )
