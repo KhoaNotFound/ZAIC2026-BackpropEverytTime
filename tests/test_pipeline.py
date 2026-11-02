@@ -309,12 +309,13 @@ def test_cli_checkpoint_resume_and_evaluation(source, tmp_path, monkeypatch):
         ],
     )
     evaluate.main()
-    assert (
-        json.loads(output.with_suffix(".evaluation.json").read_text())["overall"][
-            "accuracy"
-        ]
-        == 1
-    )
+    report = json.loads(output.with_suffix(".evaluation.json").read_text())
+    assert report["overall"]["accuracy"] == 1
+    bench = report["runtime"]
+    assert bench["model"] == "Qwen/Qwen3.5-9B" and bench["questions_run"] == 1
+    assert bench["status"] == {"ok": 1}
+    assert bench["outcome_by_status"] == {"ok": {"correct": 1}}
+    assert bench["steps_per_question"]["max"] == 2
 
 
 def test_explicit_model_split_uses_both_gpus_and_keeps_blocks_whole():

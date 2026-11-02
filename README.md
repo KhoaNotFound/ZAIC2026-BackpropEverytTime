@@ -2,30 +2,136 @@
 
 Pipeline inference cho dữ liệu kinh doanh nhiều cấu trúc. Qwen3.5 đọc README/rulebook, lựa chọn tool, tính bằng SQL và xuất JSON. Giữ nguyên Excel/CSV/SQLite; bảng trung gian được tạo trong RAM theo từng câu hỏi. Không fine-tune, không cập nhật trọng số, không tính training loss.
 
-## Chạy trên Kaggle
+## Chạy trên Kaggle (benchmark tập train)
 
-Bật Internet, chọn GPU **T4 ×2**, gắn dataset có cấu trúc:
+Mục tiêu: đo Qwen3.5-9B pretrained (chưa fine-tune) với harness hiện tại trả lời đúng được bao nhiêu câu trong tập **train**. Mọi lần chạy đều dùng `train` vì chỉ tập này có `answers.jsonl` để chấm.
+
+### 1. Chuẩn bị notebook
+
+1. Tạo notebook mới trên Kaggle. Ở panel bên phải, mục **Session options**:
+   - **Accelerator**: chọn **GPU T4 x2** (bắt buộc 2 GPU).
+   - **Internet**: bật **On** (cần để clone repo và tải trọng số Qwen từ Hugging Face).
+2. Gắn dataset: **Add Input** → tab **Your Work** / **Datasets** → chọn dataset bạn đã upload → **Add**.
+3. Dataset phải có thư mục train với cấu trúc:
 
 ```text
-<dataset>/train/
+.../train/
   questions.jsonl
   answers.jsonl
   rulebook.md
   calendar.csv
-  data/biz_101/...
+  data/biz_101/README.md ...
 ```
 
-Dataset không nằm trong Git (`data/` đã được ignore). Upload/gắn riêng vào Kaggle. Không đưa file đáp án vào thư mục con của doanh nghiệp.
+Không đưa `answers.jsonl` vào thư mục con của doanh nghiệp. Dataset không nằm trong Git (`data/` đã được ignore).
 
-Mở [notebooks/kaggle_inference.ipynb](notebooks/kaggle_inference.ipynb), sửa URL repo và DATA_DIR, rồi chạy lần lượt các cell. Hoặc chạy trong notebook:
+### 2. Tìm đường dẫn dataset
+
+Kaggle gắn dataset chỉ đọc dưới `/kaggle/input/`. Tên thư mục là slug của dataset, và có thể có thêm cấp thư mục tuỳ cách bạn upload (ví dụ file zip giải nén ra `data/train`). Notebook **tự tìm** thư mục có đủ `questions.jsonl`, `answers.jsonl`, `rulebook.md` và `data/` khi để `DATA_DIR = ""`. Muốn tự xem, chạy trong một cell:
 
 ```python
-!git clone <REPO_URL> /kaggle/working/zAIC
+!ls /kaggle/input
+!find /kaggle/input -maxdepth 4 -name questions.jsonl
+```
+
+Đường dẫn train là thư mục chứa `questions.jsonl`, ví dụ `/kaggle/input/<slug>/train`. Cũng có thể bấm vào thư mục ở panel **Input** bên phải → biểu tượng copy để lấy đường dẫn.
+
+### 3. Lấy notebook từ repo
+
+Tải file [notebooks/kaggle_inference.ipynb](notebooks/kaggle_inference.ipynb) từ GitHub, rồi trên Kaggle chọn **File → Import Notebook** và upload file đó. Hoặc tự tạo các cell như dưới đây (giống nội dung notebook).
+
+### 4. Các cell, chạy lần lượt
+
+**Cell 1: cấu hình.** Chỉ cần sửa `LIMIT` (số câu chạy thử; `0` = toàn bộ). Để `DATA_DIR = ""` để tự tìm. `OUTPUT` tự đổi theo `LIMIT`/`SEED` nên mỗi cấu hình có thư mục riêng, không bị lỗi "Output exists".
+
+```python
+REPO_URL = "https://github.com/KhoaNotFound/ZAIC2026-BackpropEverytTime.git"
+DATA_DIR = ""  # để trống: tự tìm thư mục train trong /kaggle/input
+LIMIT = 1      # số câu chạy thử; 0 = toàn bộ
+SEED = 42
+RESUME = False
+# ... hàm find_train_dirs() tự tìm DATA_DIR (xem notebook), rồi:
+OUTPUT = f"/kaggle/working/qwen_train_limit{LIMIT}_seed{SEED}/predictions.jsonl"
+```
+
+**Cell 2: clone/pull repo và cài thư viện.** Lần đầu clone, các lần sau `git pull` để lấy code mới nhất.
+
+```python
+import subprocess
+from pathlib import Path
+repo = Path("/kaggle/working/zAIC")
+if not repo.exists():
+    subprocess.run(["git", "clone", REPO_URL, str(repo)], check=True)
+else:
+    subprocess.run(["git", "-C", str(repo), "pull", "--ff-only"], check=True)
 %cd /kaggle/working/zAIC
 %pip install -r requirements.txt
 ```
 
-Nếu pip thay các thư viện đang được import, restart kernel trước khi nạp model. Giữ PyTorch CUDA có sẵn của Kaggle nếu đã đáp ứng requirements. Không cần API key cho checkpoint Qwen công khai. Lần đầu cần Internet để tải trọng số.
+Nếu pip nâng cấp thư viện đang được import (thường là `transformers`), **Restart kernel** rồi chạy lại Cell 1 và đi tiếp từ Cell 3 (không cần chạy lại Cell 2). Giữ PyTorch CUDA có sẵn của Kaggle. Không cần API key cho checkpoint Qwen công khai.
+
+**Cell 3: kiểm tra GPU.** Phải thấy 2 dòng `Tesla T4`, khoảng 14.7 GiB mỗi card.
+
+```python
+import torch
+print("PyTorch:", torch.__version__, "CUDA:", torch.cuda.is_available())
+for i in range(torch.cuda.device_count()):
+    props = torch.cuda.get_device_properties(i)
+    print(i, props.name, round(props.total_memory / 2**30, 2), "GiB")
+```
+
+**Cell 4: dry run.** Kiểm tra dữ liệu và in danh sách câu được chọn, chưa tải model.
+
+```python
+import subprocess, sys, os
+os.chdir("/kaggle/working/zAIC")
+assert (Path(DATA_DIR) / "answers.jsonl").is_file(), "DATA_DIR phải là tập train có answers.jsonl"
+base = [sys.executable, "inference.py", "--data-dir", DATA_DIR, "--limit", str(LIMIT),
+        "--seed", str(SEED), "--output", OUTPUT]
+subprocess.run(base + ["--dry-run"], check=True)
+```
+
+**Cell 5: inference trên 2 GPU.** `--device-map split` đặt 16 decoder layer lên GPU 0 và 16 layer lên GPU 1. Log in ra device map và VRAM mỗi GPU sau khi nạp, rồi một dòng cho mỗi câu (`[i/n] id status type thời_gian`). Lần đầu tải trọng số mất vài phút.
+
+```python
+import torch
+assert torch.cuda.device_count() >= 2, "Cần 2 GPU: chọn Accelerator GPU T4 x2"
+command = base + ["--model", "Qwen/Qwen3.5-9B", "--quantization", "4bit", "--device-map", "split"]
+if RESUME:
+    command += ["--resume"]
+subprocess.run(command, check=True)
+```
+
+**Cell 6: chấm điểm và in benchmark.**
+
+```python
+subprocess.run([sys.executable, "evaluate.py", "--predictions", OUTPUT,
+                "--answers", str(Path(DATA_DIR) / "answers.jsonl"),
+                "--questions", str(Path(DATA_DIR) / "questions.jsonl")], check=True)
+```
+
+Benchmark in ra gồm: số câu đúng/sai/abstain, accuracy, coverage, attempted accuracy, score (đúng +1, sai −1, abstain 0), kết quả theo loại đáp án, trạng thái kết thúc (`ok`, `stalled`, `max_steps`, `error`) và kết quả theo trạng thái, thời gian/số bước/tool call/token mỗi câu, VRAM đỉnh từng GPU, thời gian nạp model. Bản đầy đủ (thêm theo cửa hàng và từng câu) nằm trong `predictions.evaluation.json`.
+
+**Cell 7: liệt kê file kết quả.**
+
+```python
+summary = Path(OUTPUT).with_suffix(".summary.json")
+if summary.exists():
+    print(summary.read_text())
+print("Artifacts:", [p.name for p in Path(OUTPUT).parent.glob("predictions.*")])
+```
+
+### 5. Quy trình gợi ý
+
+1. `LIMIT = 1`: kiểm tra model nạp được, xem VRAM đỉnh từng GPU trong benchmark.
+2. `LIMIT = 20` (hoặc 50, 100): đo độ chính xác sơ bộ. Chỉ cần sửa Cell 1 rồi chạy lại Cell 1, 4, 5, 6.
+3. `LIMIT = 0`: toàn bộ tập train. Thời gian ước lượng cho 3.000 câu nằm trong `predictions.summary.json`; một session GPU Kaggle tối đa khoảng 12 giờ và có hạn mức GPU theo tuần, nên chạy toàn bộ có thể cần nhiều session kèm `RESUME = True`.
+4. Session bị ngắt giữa chừng: giữ nguyên Cell 1, đặt `RESUME = True`, chạy lại. Câu đã có dự đoán sẽ được bỏ qua.
+5. **Save Version** (hoặc tải thư mục `/kaggle/working/...`) để giữ kết quả; `/kaggle/working` mất khi session kết thúc.
+
+Nếu chạy dừng do lỗi (ví dụ CUDA out of memory), chương trình lưu traceback vào `predictions.traces.jsonl`, dừng và thoát mã 1. Restart kernel để giải phóng GPU trước khi chạy lại với `LIMIT`/output mới.
+
+### Chạy bằng dòng lệnh (không dùng notebook)
 
 Kiểm tra chọn mẫu, chưa tải model:
 
@@ -106,7 +212,7 @@ python inference.py \
 - `predictions.traces.jsonl`: phản hồi model, lời gọi tool, kết quả/lỗi.
 - `predictions.metrics.jsonl`: thời gian/token/VRAM theo câu, không có toàn bộ trace.
 - `predictions.summary.json`: thống kê thời gian cho phần chạy trong session hiện tại; ngoại suy null nếu có lỗi thực thi.
-- `predictions.evaluation.json`: kết quả chấm.
+- `predictions.evaluation.json`: benchmark do `evaluate.py` tạo: accuracy, coverage, score theo tổng/loại đáp án/cửa hàng, kết quả từng câu, và `runtime` (trạng thái ok/stalled/max_steps/error, kết quả theo trạng thái, thời gian, số bước, tool call, token, VRAM đỉnh mỗi GPU, thời gian nạp model).
 
 Lưu sau từng câu để tiếp tục được. Nếu tiến trình dừng giữa lúc ghi một dòng JSONL, sửa/bỏ dòng cuối không hoàn chỉnh trước khi resume; parser báo lỗi thay vì bỏ qua dữ liệu hỏng. Trace có thể chứa thông tin kinh doanh và khách hàng, cần giữ cùng phạm vi truy cập với dữ liệu nguồn.
 

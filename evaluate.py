@@ -2,6 +2,7 @@
 
 import argparse
 import json
+import statistics
 import unicodedata
 from collections import Counter, defaultdict
 from decimal import Decimal
@@ -137,6 +138,89 @@ def score(predictions, answers, ids=None, questions=None):
     }
 
 
+def stats(values):
+    values = sorted(v for v in values if v is not None)
+    if not values:
+        return None
+    return {
+        "mean": statistics.mean(values),
+        "median": statistics.median(values),
+        "p90": values[min(len(values) - 1, int(0.9 * len(values)))],
+        "max": values[-1],
+        "total": sum(values),
+    }
+
+
+def runtime(metrics, details, manifest=None):
+    """Join per-question run metrics with scoring outcomes."""
+    by_id = {m["id"]: m for m in metrics}
+    outcome_by_status = defaultdict(Counter)
+    for d in details:
+        status = by_id.get(d["id"], {}).get("status", "not_run")
+        outcome_by_status[status][d["outcome"]] += 1
+    peak = defaultdict(lambda: {"allocated_peak_gib": 0.0, "reserved_peak_gib": 0.0})
+    for m in metrics:
+        for gpu, mem in (m.get("gpu_memory") or {}).items():
+            for key in peak[gpu]:
+                peak[gpu][key] = max(peak[gpu][key], mem.get(key, 0.0))
+    config = (manifest or {}).get("config", {})
+    return {
+        "model": config.get("model"),
+        "quantization": config.get("quantization"),
+        "device_map_mode": config.get("device_map"),
+        "load_seconds": (manifest or {}).get("load_seconds"),
+        "questions_run": len(metrics),
+        # ok = model gave a final answer; stalled/max_steps/error are harness-level stops.
+        "status": dict(Counter(m["status"] for m in metrics)),
+        "outcome_by_status": {k: dict(v) for k, v in outcome_by_status.items()},
+        "seconds_per_question": stats(m.get("elapsed_seconds") for m in metrics),
+        "steps_per_question": stats(m.get("steps") for m in metrics),
+        "tool_calls_per_question": stats(m.get("tool_calls") for m in metrics),
+        "input_tokens_per_question": stats(m.get("input_tokens") for m in metrics),
+        "output_tokens_per_question": stats(m.get("output_tokens") for m in metrics),
+        "peak_gpu_memory_gib": dict(peak),
+    }
+
+
+def print_report(report):
+    o = report["overall"]
+    print(
+        f"Overall: {o['correct']}/{o['total']} correct, {o['incorrect']} incorrect, "
+        f"{o['abstained']} abstained | accuracy {o['accuracy']:.1%}, "
+        f"coverage {o['coverage']:.1%}, attempted accuracy {o['attempted_accuracy']:.1%}, "
+        f"score {o['score']}"
+    )
+    print("By answer type:")
+    for kind, s in sorted(report["by_type"].items()):
+        print(
+            f"  {kind:<13} {s['correct']:>3}/{s['total']:<3} correct  "
+            f"{s['incorrect']:>3} incorrect  {s['abstained']:>3} abstained"
+        )
+    r = report.get("runtime")
+    if not r:
+        return
+    load = r["load_seconds"]
+    print(
+        f"Model: {r['model']} ({r['quantization']}, device map {r['device_map_mode']}), "
+        f"load {load:.0f}s" if load is not None else f"Model: {r['model']}"
+    )
+    print("Run status:", r["status"])
+    print("Outcome by status:", r["outcome_by_status"])
+    for key in ["seconds_per_question", "steps_per_question", "tool_calls_per_question",
+                "input_tokens_per_question", "output_tokens_per_question"]:
+        s = r[key]
+        if s:
+            print(
+                f"  {key:<27} mean {s['mean']:.1f}  median {s['median']:.1f}  "
+                f"p90 {s['p90']:.1f}  max {s['max']:.1f}"
+            )
+    for gpu, mem in sorted(r["peak_gpu_memory_gib"].items()):
+        print(
+            f"  GPU {gpu} peak: {mem['allocated_peak_gib']:.2f} GiB allocated, "
+            f"{mem['reserved_peak_gib']:.2f} GiB reserved"
+        )
+
+
 def main():
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument("--predictions", type=Path, required=True)
@@ -163,10 +247,19 @@ def main():
     report = score(
         preds, golds, ids, read_jsonl(args.questions) if args.questions else None
     )
+    metrics_path = args.predictions.with_suffix(".metrics.jsonl")
+    if metrics_path.exists():
+        manifest_path = args.predictions.with_suffix(".run.json")
+        manifest = (
+            json.loads(manifest_path.read_text()) if manifest_path.exists() else None
+        )
+        report["runtime"] = runtime(
+            read_jsonl(metrics_path), report["details"], manifest
+        )
     output = args.output or args.predictions.with_suffix(".evaluation.json")
     output.parent.mkdir(parents=True, exist_ok=True)
     output.write_text(json.dumps(report, ensure_ascii=False, indent=2) + "\n")
-    print(json.dumps(report["overall"], indent=2))
+    print_report(report)
     print(f"Details: {output}")
 
 
