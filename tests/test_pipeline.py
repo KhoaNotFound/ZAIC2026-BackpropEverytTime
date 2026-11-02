@@ -545,3 +545,64 @@ def test_agent_stops_identical_protocol_errors(source):
     _, detail = answer_question(backend, source, {"id": "q", "business_id": "biz_1"})
     assert detail["status"] == "stalled"
     assert detail["steps"] == 3
+
+
+def test_cli_continues_after_context_limit(source, tmp_path, monkeypatch):
+    import importlib.metadata
+    import sys
+
+    import inference
+    import zaic.model
+    from zaic.model import ContextLimitError
+
+    questions = [
+        {
+            "id": f"q{i}",
+            "business_id": "biz_1",
+            "question": "Tổng tiền?",
+            "as_of_date": "2026-01-01",
+        }
+        for i in range(2)
+    ]
+    (source / "questions.jsonl").write_text(
+        "".join(json.dumps(q) + "\n" for q in questions)
+    )
+    replies = iter(
+        [
+            ContextLimitError("Context limit: 15513 input + 2048 output > 16384"),
+            '{"action":"tool","name":"query_sqlite","arguments":{"path":"pos.sqlite","sql":"select sum(amount) from sales"}}',
+            '{"action":"final","type":"number","answer":300}',
+        ]
+    )
+
+    class LongPromptBackend:
+        def __init__(self, *args):
+            self.device_map = {"": "cpu"}
+
+        def reset_peak(self):
+            pass
+
+        def memory(self):
+            return {}
+
+        def generate(self, messages):
+            reply = next(replies)
+            if isinstance(reply, Exception):
+                raise reply
+            return reply, {"input_tokens": 10, "output_tokens": 5}
+
+    monkeypatch.setattr(zaic.model, "QwenBackend", LongPromptBackend)
+    monkeypatch.setattr(importlib.metadata, "version", lambda package: "test")
+    output = tmp_path / "ctx" / "predictions.jsonl"
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        ["inference.py", "--data-dir", str(source), "--limit", "2", "--seed", "1", "--output", str(output)],
+    )
+    inference.main()  # no SystemExit: the run is not stopped
+    predictions = read_jsonl(output)
+    assert len(predictions) == 2
+    statuses = [m["status"] for m in read_jsonl(output.with_suffix(".metrics.jsonl"))]
+    assert statuses == ["context_limit", "ok"]
+    assert predictions[0]["type"] == "abstain" and predictions[1]["answer"] == 300
+    assert json.loads(output.with_suffix(".summary.json").read_text())["stopped_on_error"] is False

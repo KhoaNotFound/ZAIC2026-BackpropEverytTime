@@ -3,6 +3,13 @@
 import time
 
 
+class ContextLimitError(RuntimeError):
+    """Prompt plus output budget exceeds --context-tokens for one question.
+
+    Unlike OOM this leaves the model usable, so the run continues.
+    """
+
+
 def make_split_map(module_names, num_layers, gpu_count, tied_embeddings=False):
     """Place whole decoder blocks contiguously across GPUs, never split a block."""
     if gpu_count < 2:
@@ -149,7 +156,7 @@ class QwenBackend:
         encoded = self.tokenizer(text, return_tensors="pt", add_special_tokens=False)
         input_tokens = encoded["input_ids"].shape[1]
         if input_tokens + self.max_new_tokens > self.context_tokens:
-            raise RuntimeError(
+            raise ContextLimitError(
                 f"Context limit: {input_tokens} input + {self.max_new_tokens} output > "
                 f"{self.context_tokens}. Increase --context-tokens or reduce tool output/steps."
             )

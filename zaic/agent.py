@@ -4,6 +4,7 @@ import traceback
 from collections import Counter
 
 from .formats import normalize_action, parse_action, valid_answer
+from .model import ContextLimitError
 from .tools import TOOL_HELP, Tools, encode
 
 SYSTEM = """You answer Vietnamese business questions using the supplied business files.
@@ -159,6 +160,9 @@ def answer_question(backend, split_dir, question, max_steps=16, tool_chars=10000
                 )
         else:
             status, error = "max_steps", "Agent exhausted tool/action budget"
+    except ContextLimitError as exc:
+        # Per-question budget overflow: abstain and let the run continue.
+        status, error = "context_limit", str(exc)
     except Exception as exc:  # noqa: BLE001 -- capture tool/model failures for retry and checkpoints
         status, error = "error", f"{type(exc).__name__}: {exc}"
         error_traceback = traceback.format_exc()

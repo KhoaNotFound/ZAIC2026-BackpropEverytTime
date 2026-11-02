@@ -42,16 +42,17 @@ Tải file [notebooks/kaggle_inference.ipynb](notebooks/kaggle_inference.ipynb) 
 
 ### 4. Các cell, chạy lần lượt
 
-**Cell 1: cấu hình.** Chỉ cần sửa `LIMIT` (số câu chạy thử; `0` = toàn bộ). Để `DATA_DIR = ""` để tự tìm. `OUTPUT` tự đổi theo `LIMIT`/`SEED` nên mỗi cấu hình có thư mục riêng, không bị lỗi "Output exists".
+**Cell 1: cấu hình.** Chỉ cần sửa `LIMIT` (số câu chạy thử; `0` = toàn bộ). Để `DATA_DIR = ""` để tự tìm. `OUTPUT` tự đổi theo `LIMIT`/`SEED`/`CONTEXT_TOKENS` nên mỗi cấu hình có thư mục riêng, không bị lỗi "Output exists".
 
 ```python
 REPO_URL = "https://github.com/KhoaNotFound/ZAIC2026-BackpropEverytTime.git"
 DATA_DIR = ""  # để trống: tự tìm thư mục train trong /kaggle/input
 LIMIT = 1      # số câu chạy thử; 0 = toàn bộ
 SEED = 42
+CONTEXT_TOKENS = 32768  # input + output mỗi bước
 RESUME = False
 # ... hàm find_train_dirs() tự tìm DATA_DIR (xem notebook), rồi:
-OUTPUT = f"/kaggle/working/qwen_train_limit{LIMIT}_seed{SEED}/predictions.jsonl"
+OUTPUT = f"/kaggle/working/qwen_train_limit{LIMIT}_seed{SEED}_ctx{CONTEXT_TOKENS}/predictions.jsonl"
 ```
 
 **Cell 2: clone/pull repo và cài thư viện.** Lần đầu clone, các lần sau `git pull` để lấy code mới nhất.
@@ -96,7 +97,8 @@ subprocess.run(base + ["--dry-run"], check=True)
 ```python
 import torch
 assert torch.cuda.device_count() >= 2, "Cần 2 GPU: chọn Accelerator GPU T4 x2"
-command = base + ["--model", "Qwen/Qwen3.5-9B", "--quantization", "4bit", "--device-map", "split"]
+command = base + ["--model", "Qwen/Qwen3.5-9B", "--quantization", "4bit", "--device-map", "split",
+                   "--context-tokens", str(CONTEXT_TOKENS)]
 if RESUME:
     command += ["--resume"]
 subprocess.run(command, check=True)
@@ -128,6 +130,8 @@ print("Artifacts:", [p.name for p in Path(OUTPUT).parent.glob("predictions.*")])
 3. `LIMIT = 0`: toàn bộ tập train. Thời gian ước lượng cho 3.000 câu nằm trong `predictions.summary.json`; một session GPU Kaggle tối đa khoảng 12 giờ và có hạn mức GPU theo tuần, nên chạy toàn bộ có thể cần nhiều session kèm `RESUME = True`.
 4. Session bị ngắt giữa chừng: giữ nguyên Cell 1, đặt `RESUME = True`, chạy lại. Câu đã có dự đoán sẽ được bỏ qua.
 5. **Save Version** (hoặc tải thư mục `/kaggle/working/...`) để giữ kết quả; `/kaggle/working` mất khi session kết thúc.
+
+**Context:** system prompt + `rulebook.md` (~36 KB) + README cửa hàng đã khoảng 12-13 nghìn token trước khi gọi tool, nên notebook dùng `CONTEXT_TOKENS = 32768` thay vì mặc định 16384 của `inference.py`. Câu nào vẫn vượt giới hạn sẽ abstain với trạng thái `context_limit` và chạy tiếp câu sau, không dừng cả đợt. Nếu benchmark báo nhiều `context_limit`, tăng lên 49152 hoặc 65536 và theo dõi VRAM đỉnh; context dài hơn cũng làm mỗi bước chậm hơn vì toàn bộ prompt được xử lý lại.
 
 Nếu chạy dừng do lỗi (ví dụ CUDA out of memory), chương trình lưu traceback vào `predictions.traces.jsonl`, dừng và thoát mã 1. Restart kernel để giải phóng GPU trước khi chạy lại với `LIMIT`/output mới.
 
@@ -167,7 +171,7 @@ Nếu dùng uv trên Kaggle, cập nhật repo rồi chạy trong cell:
 Dừng tiến trình inference cũ trước khi chạy; nếu model còn trong kernel notebook, restart session/kernel để giải phóng GPU. Khi đổi device map hãy dùng output mới thay vì resume đợt chạy cũ. Split giúp phân bổ trọng số nhưng vẫn có thể OOM do context dài hoặc tiến trình khác chiếm VRAM; chưa benchmark bản sửa trên T4 thật. Nếu còn lỗi, xem `error_traceback` trong trace/metrics để xác định phép tính lỗi.
 
 
-Nếu vượt context, chương trình ghi lỗi rồi abstain, không âm thầm cắt mất rulebook. Hãy xem trace, tăng `--context-tokens` nếu VRAM cho phép, hoặc giảm độ dài tool output/chuỗi xử lý. `--thinking` bật suy luận nội bộ, có thể cần tăng `--max-new-tokens`; mặc định tắt để đo baseline nhanh hơn. Generation mặc định greedy để dễ tái lập, không phải sampling preset tối ưu của nhà phát hành.
+Nếu vượt context, câu đó abstain với trạng thái `context_limit` (không âm thầm cắt mất rulebook) và đợt chạy tiếp tục với câu sau. Hãy xem trace, tăng `--context-tokens` nếu VRAM cho phép, hoặc giảm độ dài tool output/chuỗi xử lý. `--thinking` bật suy luận nội bộ, có thể cần tăng `--max-new-tokens`; mặc định tắt để đo baseline nhanh hơn. Generation mặc định greedy để dễ tái lập, không phải sampling preset tối ưu của nhà phát hành.
 
 ### Chấm kết quả
 
