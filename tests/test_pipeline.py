@@ -487,10 +487,11 @@ def test_normalize_observed_qwen_calls(raw, expected):
         {"action": "tool", "name": "run_python", "arguments": {}},
         {
             "action": "load_table",
-            "arguments": {"path": "sales.csv"},
+            "arguments": {"path": "sales.csv", "name": "first"},
             "name": "conflicting",
         },
         {"action": "run_sql", "arguments": "SELECT 1"},
+        {"action": "tool", "name": "load_table", "arguments": {"path": "sales.csv"}},
     ],
 )
 def test_normalization_rejects_unknown_or_ambiguous_actions(action):
@@ -597,7 +598,17 @@ def test_cli_continues_after_context_limit(source, tmp_path, monkeypatch):
     monkeypatch.setattr(
         sys,
         "argv",
-        ["inference.py", "--data-dir", str(source), "--limit", "2", "--seed", "1", "--output", str(output)],
+        [
+            "inference.py",
+            "--data-dir",
+            str(source),
+            "--limit",
+            "2",
+            "--seed",
+            "1",
+            "--output",
+            str(output),
+        ],
     )
     inference.main()  # no SystemExit: the run is not stopped
     predictions = read_jsonl(output)
@@ -605,4 +616,145 @@ def test_cli_continues_after_context_limit(source, tmp_path, monkeypatch):
     statuses = [m["status"] for m in read_jsonl(output.with_suffix(".metrics.jsonl"))]
     assert statuses == ["context_limit", "ok"]
     assert predictions[0]["type"] == "abstain" and predictions[1]["answer"] == 300
-    assert json.loads(output.with_suffix(".summary.json").read_text())["stopped_on_error"] is False
+    assert (
+        json.loads(output.with_suffix(".summary.json").read_text())["stopped_on_error"]
+        is False
+    )
+
+
+def test_parse_tolerates_prose_and_rejects_truncated_json():
+    from zaic.formats import ProtocolError
+
+    assert (
+        parse_action('I will list files.\n{"action":"final","type":"abstain"} done')[
+            "type"
+        ]
+        == "abstain"
+    )
+    assert parse_action('{"bad": } {"action":"final"}')["action"] == "final"
+    with pytest.raises(ProtocolError):
+        parse_action(
+            '{"action":"tool","name":"run_sql","arguments":{"sql":"SELECT 1 OR'
+        )
+
+
+def test_normalize_merges_extras_and_drops_unknown_keys():
+    from zaic.formats import normalize_action
+
+    assert normalize_action(
+        {"action": "tool", "name": "run_sql", "sql": "select 1", "thought": "x"}
+    ) == {"action": "tool", "name": "run_sql", "arguments": {"sql": "select 1"}}
+    assert normalize_action(
+        {"action": "inspect_table", "name": "inspect_table", "path": "a.csv"}
+    ) == {"action": "tool", "name": "inspect_table", "arguments": {"path": "a.csv"}}
+    assert (
+        normalize_action(
+            {"action": "load_table", "path": "a.csv", "name": "t", "header_row": "1"}
+        )["arguments"]["header_row"]
+        == 1
+    )
+    final = {"action": "final", "type": "number", "answer": 1, "reasoning": "r"}
+    assert normalize_action(final) == {"action": "final", "type": "number", "answer": 1}
+
+
+def test_tools_call_reports_signature(source):
+    tools = Tools(source, "biz_1")
+    try:
+        with pytest.raises(TypeError, match="required"):
+            tools.call("inspect_table", {"file": "sales.csv"})
+    finally:
+        tools.close()
+
+
+def test_json_stop_detects_complete_action():
+    from zaic.model import reply_complete
+
+    assert reply_complete('{"action":"final","type":"abstain"}', thinking=False)
+    assert not reply_complete(
+        '{"action":"tool","arguments":{"sql":"x"}', thinking=False
+    )
+    assert not reply_complete('<think>{"a":1}', thinking=True)
+    assert reply_complete('<think>{"a":1}</think>{"action":"final"}', thinking=True)
+
+
+def test_question_seed_is_stable_and_order_independent():
+    from inference import question_seed
+
+    assert question_seed(42, "q1") == question_seed(42, "q1")
+    assert question_seed(42, "q1") != question_seed(42, "q2")
+    assert question_seed(42, "q1") != question_seed(43, "q1")
+
+
+def ask(backend, source):
+    return answer_question(
+        backend,
+        source,
+        {
+            "id": "q",
+            "business_id": "biz_1",
+            "question": "Tổng?",
+            "as_of_date": "2026-01-01",
+        },
+    )
+
+
+def test_sql_error_feedback_lists_loaded_columns(source):
+    backend = ScriptedBackend(
+        [
+            '{"action":"load_table","path":"sales.csv","name":"sales"}',
+            '{"action":"run_sql","sql":"SELECT SUM(REPLACE(\',\', \'\', amount)) FROM sale"}',
+            '{"action":"run_sql","sql":"SELECT SUM(CAST(amount AS INTEGER)) FROM sales WHERE status=\'done\'"}',
+            '{"action":"final","type":"number","answer":300}',
+        ]
+    )
+    prediction, detail = ask(backend, source)
+    assert prediction["answer"] == 300 and detail["status"] == "ok"
+    feedback = detail["trace"][1]["feedback"]
+    assert "Tool error from run_sql" in feedback
+    assert '"sales": ["id", "status", "amount"]' in feedback
+    assert "list_files" not in feedback
+
+
+def test_repeated_action_is_warned_not_rerun(source):
+    call = '{"action":"tool","name":"query_sqlite","arguments":{"path":"pos.sqlite","sql":"select sum(amount) from sales"}}'
+    backend = ScriptedBackend(
+        [call, call, '{"action":"final","type":"number","answer":300}']
+    )
+    prediction, detail = ask(backend, source)
+    assert prediction["answer"] == 300 and detail["status"] == "ok"
+    assert "tool_result" not in detail["trace"][1]
+    assert "repeated your previous action" in detail["trace"][1]["feedback"]
+    assert detail["tool_calls"] == 1
+
+
+def test_repeat_counter_resets_on_different_reply(source):
+    listing = '{"action":"list_files"}'
+    backend = ScriptedBackend([listing, listing, "not json", listing, listing, listing])
+    _, detail = ask(backend, source)
+    assert detail["status"] == "stalled" and detail["steps"] == 6
+
+
+def test_final_needs_data_evidence_not_only_listing(source):
+    backend = ScriptedBackend(
+        [
+            '{"action":"list_files"}',
+            '{"action":"final","type":"number","answer":5}',
+            '{"action":"final","type":"number","answer":"5"}',
+            '{"action":"inspect_table","path":"sales.csv"}',
+            '{"action":"final","type":"number","answer":5}',
+        ]
+    )
+    prediction, detail = ask(backend, source)
+    assert prediction["answer"] == 5
+    assert "No data tool has succeeded" in detail["trace"][1]["feedback"]
+    assert "a JSON number" in detail["trace"][2]["feedback"]
+
+
+def test_invalid_long_reply_is_shortened_in_history(source):
+    junk = "{" + " OR x" * 2000
+    backend = ScriptedBackend([junk, '{"action":"final","type":"abstain"}'])
+    _, detail = ask(backend, source)
+    assert detail["trace"][0]["response"] == junk
+    assert junk not in backend.prompts[1]
+    assert "more characters omitted" in backend.prompts[1]
+    assert "SECRET LABEL" not in "".join(backend.prompts)

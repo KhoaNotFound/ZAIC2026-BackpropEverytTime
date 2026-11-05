@@ -1,9 +1,7 @@
-import json
 import time
 import traceback
-from collections import Counter
 
-from .formats import normalize_action, parse_action, valid_answer
+from .formats import ProtocolError, normalize_action, parse_action, valid_answer
 from .model import ContextLimitError
 from .tools import TOOL_HELP, Tools, encode
 
@@ -17,7 +15,8 @@ Use decimal arithmetic for money (SQL DECIMAL), explicit rounding, correct order
 Missing data is not zero. Tool failure or inability to calculate is not proof of unanswerability.
 Use unanswerable only when source data cannot determine an answer. Use abstain if unable to finish.
 
-Return EXACTLY ONE JSON object each turn, with no prose or markdown:
+Return EXACTLY ONE JSON object each turn, with no prose or markdown. Each turn you get the
+tool result or an error message for your previous action:
 {"action":"tool","name":"list_files","arguments":{}}
 {"action":"tool","name":"inspect_table","arguments":{"path":"actual_file.xlsx"}}
 {"action":"tool","name":"load_table","arguments":{"path":"actual_file.xlsx","name":"sales","sheet":"actual_sheet","header_row":0}}
@@ -33,35 +32,106 @@ Do not include action or reasoning in answer values. A final answer requires act
 """
 
 
+# Tools whose successful result counts as evidence for a final answer. The file
+# list is already in the prompt, so list_files alone is not evidence.
+EVIDENCE_TOOLS = {
+    "read_document",
+    "inspect_table",
+    "load_table",
+    "run_sql",
+    "query_sqlite",
+}
+SQL_TOOLS = {"run_sql", "query_sqlite"}
+PROTOCOL_HELP = (
+    "Reply with exactly one JSON object, for example "
+    '{"action":"tool","name":"run_sql","arguments":{"sql":"SELECT ..."}} or '
+    '{"action":"final","type":"number","answer":123}.'
+)
+FINAL_FORMATS = {
+    "number": '{"action":"final","type":"number","answer":123.5} (a JSON number, not a string)',
+    "percent": '{"action":"final","type":"percent","answer":12.4} (12.4 means 12.4%)',
+    "string": '{"action":"final","type":"string","answer":"text"}',
+    "date": '{"action":"final","type":"date","answer":"2026-06-28"} (YYYY-MM-DD or YYYY-MM)',
+    "boolean": '{"action":"final","type":"boolean","answer":true}',
+    "list": '{"action":"final","type":"list","answer":["a","b"]} (scalars only, ordered)',
+    "table": '{"action":"final","type":"table","answer":{"columns":["c1","c2"],"rows":[["x",1]]}}',
+    "unanswerable": '{"action":"final","type":"unanswerable","reason":"why the data cannot answer"}',
+    "abstain": '{"action":"final","type":"abstain"}',
+}
+# Invalid replies (often runaway repetition) are shortened in the history so they
+# neither fill the context nor prime the model to repeat them. The trace keeps all.
+INVALID_REPLY_CHARS = 600
+ERROR_CHARS = 1500
+
+
+def shorten(text, limit):
+    if len(text) <= limit:
+        return text
+    return text[:limit] + f" ...[{len(text) - limit} more characters omitted]"
+
+
+def final_problem(candidate, has_evidence):
+    kind = candidate.get("type")
+    if kind not in FINAL_FORMATS:
+        return f"Unknown final type {kind!r}. Valid final formats:\n" + "\n".join(
+            FINAL_FORMATS.values()
+        )
+    if not valid_answer(candidate):
+        return f"Final answer does not match type {kind!r}. Expected: {FINAL_FORMATS[kind]}"
+    if kind not in {"abstain", "unanswerable"} and not has_evidence:
+        return (
+            "No data tool has succeeded yet. Inspect/load the data and calculate with "
+            "run_sql or query_sqlite before giving a final answer."
+        )
+    return None
+
+
+def tool_error_feedback(name, exc, tools, file_paths):
+    message = shorten(f"{type(exc).__name__}: {exc}", ERROR_CHARS)
+    lines = [f"Tool error from {name}: {message}"]
+    if name == "run_sql":
+        tables = tools.describe_tables()
+        if tables:
+            lines.append(
+                "Fix the SQL. Loaded DuckDB tables and their exact columns: "
+                + shorten(encode(tables), 4000)
+            )
+        else:
+            lines.append("No table is loaded yet; call load_table before run_sql.")
+    elif name == "query_sqlite":
+        lines.append(
+            "Fix the SQL. inspect_table on the .sqlite file shows table schemas."
+        )
+    else:
+        lines.append(
+            "Use exact paths from the file list "
+            + encode(file_paths)
+            + " and exact sheet names from inspect_table. load_table needs arguments "
+            '"path" and a new table "name" (letters, digits, underscore).'
+        )
+    lines.append(
+        "Change the call; this error is not evidence that the question is unanswerable."
+    )
+    return "\n".join(lines)
+
+
 def answer_question(backend, split_dir, question, max_steps=16, tool_chars=10000):
     start = time.perf_counter()
     tools = Tools(split_dir, question["business_id"])
     trace, usages = [], []
-    failure_counts = Counter()
-    last_call, repeated_calls = None, 0
+    last_key, same_count, has_evidence = None, 0, False
     status, error, error_traceback = "ok", None, None
     prediction = {"id": question["id"], "type": "abstain"}
-    messages = [
-        {"role": "system", "content": SYSTEM + "\n" + TOOL_HELP},
-        {"role": "user", "content": encode(question)},
-    ]
     try:
         # Both documents are source-only. No answers.jsonl path is passed to any tool.
-        for path in ["rulebook.md", "README.md"]:
-            text = tools.resolve(path).read_text(encoding="utf-8")
-            messages.append(
-                {"role": "user", "content": f"Source document {path}:\n{text}"}
-            )
+        documents = {
+            path: tools.resolve(path).read_text(encoding="utf-8")
+            for path in ["rulebook.md", "README.md"]
+        }
         files = tools.list_files()
-        messages.append(
-            {"role": "user", "content": "Available files:\n" + encode(files)}
-        )
+        file_paths = [f["path"] for f in files]
         first_table = next(
-            (
-                f["path"]
-                for f in files
-                if f["path"].lower().endswith((".xlsx", ".csv", ".sqlite"))
-            ),
+            (p for p in file_paths if p.lower().endswith((".xlsx", ".csv", ".sqlite"))),
             None,
         )
         inspection_example = {
@@ -69,95 +139,92 @@ def answer_question(backend, split_dir, question, max_steps=16, tool_chars=10000
             "name": "inspect_table" if first_table else "read_document",
             "arguments": {"path": first_table or "README.md"},
         }
-        messages.append(
-            {
-                "role": "user",
-                "content": "Question to answer: "
-                + encode(question)
-                + "\nUse the available filenames and inspect sheets before loading. "
-                + "Example for a source file that exists: "
+        prompt = "\n\n".join(
+            [f"Source document {path}:\n{text}" for path, text in documents.items()]
+            + [
+                "Available files (current business):\n" + encode(files),
+                "Question to answer: " + encode(question),
+                "Inspect a relevant file before loading it, for example "
                 + encode(inspection_example)
-                + '. To list files: {"action":"tool","name":"list_files","arguments":{}}. '
-                'After computing, return {"action":"final","type":"number","answer":123} with the actual result.',
-            }
+                + ". Reply with one JSON action.",
+            ]
         )
+        messages = [
+            {"role": "system", "content": SYSTEM + "\n" + TOOL_HELP},
+            {"role": "user", "content": prompt},
+        ]
         for step in range(max_steps):
             raw, usage = backend.generate(messages)
             usages.append(usage)
-            messages.append({"role": "assistant", "content": raw})
             event = {"step": step + 1, "response": raw, "usage": usage}
             trace.append(event)
             try:
-                action = normalize_action(parse_action(raw))
+                action, protocol_error = normalize_action(parse_action(raw)), None
+            except (ProtocolError, TypeError, ValueError) as exc:
+                action, protocol_error = None, exc
+            key = encode(action) if action else raw.strip()
+            same_count = same_count + 1 if key == last_key else 1
+            last_key = key
+            if same_count >= 3:
+                status, error = (
+                    "stalled",
+                    "Repeated an identical response three times in a row",
+                )
+                event["tool_error"] = error
+                break
+            if action is None:
+                event["tool_error"] = (
+                    f"{type(protocol_error).__name__}: {protocol_error}"
+                )
+                history = shorten(raw, INVALID_REPLY_CHARS)
+                feedback = f"Protocol error: {protocol_error}. {PROTOCOL_HELP}"
+            else:
                 event["normalized_action"] = action
                 # Feed the accepted structure back instead of reinforcing malformed calls.
-                messages[-1]["content"] = encode(action)
-                if action.get("action") == "final":
-                    candidate = {
-                        k: v
-                        for k, v in action.items()
-                        if k in {"type", "answer", "reason"}
-                    }
-                    if not valid_answer(candidate):
-                        raise ValueError("Final answer has an invalid type/format")
-                    if candidate["type"] not in {"abstain", "unanswerable"} and not any(
-                        "tool_result" in e and "tool_error" not in e for e in trace
-                    ):
-                        raise ValueError(
-                            "Calculate using a tool before giving an answer"
-                        )
-                    prediction = {"id": question["id"], **candidate}
-                    break
-                if action.get("action") != "tool":
-                    raise ValueError("Expected action tool or final")
-                call_key = json.dumps(action, ensure_ascii=False, sort_keys=True)
-                repeated_calls = repeated_calls + 1 if call_key == last_call else 1
-                last_call = call_key
-                if repeated_calls >= 3:
-                    status, error = (
-                        "stalled",
-                        "Repeated the same tool call three times without progress",
+                history = encode(action)
+                if same_count == 2:
+                    # Same input gives the same outcome: warn instead of re-running.
+                    event["tool_error"] = "Repeated the previous action"
+                    feedback = (
+                        "You repeated your previous action exactly; its outcome is above and "
+                        "would not change. Use that result, change the arguments, or call "
+                        "another tool."
                     )
-                    event["tool_error"] = error
-                    break
-                event["tool_name"] = action["name"]
-                result = tools.call(action["name"], action.get("arguments", {}))
-                payload = encode(result)
-                if len(payload) > tool_chars:
-                    # Keep JSON intact; make truncation explicit and recoverable.
-                    payload = encode(
-                        {
-                            "truncated": True,
-                            "total_chars": len(payload),
-                            "preview_text": payload[:tool_chars],
-                            "hint": "Use smaller document pages or aggregate/narrow SQL results.",
-                        }
-                    )
-                event["tool_result"] = payload
-                messages.append({"role": "user", "content": "Tool result:\n" + payload})
-            except Exception as exc:  # noqa: BLE001 -- capture tool/model failures for retry and checkpoints
-                event["tool_error"] = f"{type(exc).__name__}: {exc}"
-                failure_key = (raw.strip(), event["tool_error"])
-                failure_counts[failure_key] += 1
-                if failure_counts[failure_key] >= 3:
-                    status, error = (
-                        "stalled",
-                        "Repeated an identical failed response three times",
-                    )
-                    break
-                messages.append(
-                    {
-                        "role": "user",
-                        "content": "Tool/protocol error: "
-                        + event["tool_error"]
-                        + '\nUse exactly {"action":"tool","name":"list_files","arguments":{}} to discover files, '
-                        + "or inspect an existing source with "
-                        + encode(inspection_example)
-                        + ". "
-                        + "load_table table name belongs inside arguments.name. Change the failed call; do not repeat it. "
-                        + "This error is not evidence of unanswerability.",
-                    }
-                )
+                elif action["action"] == "final":
+                    candidate = {k: v for k, v in action.items() if k != "action"}
+                    problem = final_problem(candidate, has_evidence)
+                    if problem is None:
+                        prediction = {"id": question["id"], **candidate}
+                        break
+                    event["tool_error"] = problem
+                    feedback = "Final answer rejected: " + problem
+                else:
+                    name = action["name"]
+                    event["tool_name"] = name
+                    try:
+                        result = tools.call(name, action["arguments"])
+                    except Exception as exc:  # noqa: BLE001 -- tool failures are fed back to the model
+                        event["tool_error"] = f"{type(exc).__name__}: {exc}"
+                        feedback = tool_error_feedback(name, exc, tools, file_paths)
+                    else:
+                        has_evidence |= name in EVIDENCE_TOOLS
+                        payload = encode(result)
+                        if len(payload) > tool_chars:
+                            # Keep JSON intact; make truncation explicit and recoverable.
+                            payload = encode(
+                                {
+                                    "truncated": True,
+                                    "total_chars": len(payload),
+                                    "preview_text": payload[:tool_chars],
+                                    "hint": "Use smaller document pages or aggregate/narrow SQL results.",
+                                }
+                            )
+                        event["tool_result"] = payload
+                        feedback = "Tool result:\n" + payload
+            if "tool_error" in event:
+                event["feedback"] = feedback
+            messages.append({"role": "assistant", "content": history})
+            messages.append({"role": "user", "content": feedback})
         else:
             status, error = "max_steps", "Agent exhausted tool/action budget"
     except ContextLimitError as exc:
@@ -176,7 +243,7 @@ def answer_question(backend, split_dir, question, max_steps=16, tool_chars=10000
         "error_traceback": error_traceback,
         "elapsed_seconds": time.perf_counter() - start,
         "steps": len(trace),
-        "tool_calls": sum("tool_result" in t or "tool_error" in t for t in trace),
+        "tool_calls": sum("tool_name" in t for t in trace),
         "input_tokens": sum(u["input_tokens"] for u in usages),
         "output_tokens": sum(u["output_tokens"] for u in usages),
         "trace": trace,

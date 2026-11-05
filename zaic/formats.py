@@ -70,56 +70,115 @@ def scalar(value):
     return isinstance(value, str) or type(value) is bool or number(value)
 
 
-def parse_action(text):
+class ProtocolError(ValueError):
+    """The model reply is not a usable action (bad JSON, unknown tool, bad arguments)."""
+
+
+def strip_reasoning(text):
     # Discard explicit reasoning only if the model emitted a closing tag.
-    text = text.rsplit("</think>", 1)[-1].strip()
-    if text.startswith("```"):
-        text = re.sub(r"^```(?:json)?\s*|\s*```$", "", text)
-    action = json.loads(text)
-    if not isinstance(action, dict):
-        raise TypeError("Expected one JSON object")
-    return action
+    return text.rsplit("</think>", 1)[-1].strip()
 
 
-TOOL_NAMES = frozenset(
-    {
-        "list_files",
-        "read_document",
-        "inspect_table",
-        "load_table",
-        "run_sql",
-        "query_sqlite",
-    }
-)
+def first_json_object(text):
+    """Return (object, end_index) for the first complete top-level JSON object, else None.
+
+    Tolerates prose or a markdown fence around the object. Only spans whose outer
+    braces balance are tried, so a truncated reply never yields one of its nested
+    objects (e.g. the "arguments" of an unfinished call).
+    """
+    depth, start, in_string, escape = 0, None, False, False
+    for i, ch in enumerate(text):
+        if depth and in_string:
+            if escape:
+                escape = False
+            elif ch == "\\":
+                escape = True
+            elif ch == '"':
+                in_string = False
+        elif depth and ch == '"':
+            in_string = True
+        elif ch == "{":
+            if depth == 0:
+                start = i
+            depth += 1
+        elif ch == "}" and depth:
+            depth -= 1
+            if depth == 0:
+                try:
+                    value = json.loads(text[start : i + 1])
+                except json.JSONDecodeError:
+                    continue
+                if isinstance(value, dict):
+                    return value, i + 1
+    return None
+
+
+def parse_action(text):
+    found = first_json_object(strip_reasoning(text))
+    if found is None:
+        raise ProtocolError("Reply contains no complete JSON object")
+    return found[0]
+
+
+# Parameters accepted by each tool: required, optional. Mirrors zaic.tools.Tools.
+TOOL_PARAMS = {
+    "list_files": ((), ()),
+    "read_document": (("path",), ("offset", "limit")),
+    "inspect_table": (("path",), ()),
+    "load_table": (("path", "name"), ("sheet", "header_row")),
+    "run_sql": (("sql",), ()),
+    "query_sqlite": (("path", "sql"), ()),
+}
+TOOL_NAMES = frozenset(TOOL_PARAMS)
+INTEGER_PARAMS = {"offset", "limit", "header_row"}
 
 
 def normalize_action(action):
-    """Accept only known tools in wrapped or flat JSON, without guessing arguments."""
+    """Canonicalize wrapped or flat tool calls to {"action","name","arguments"}.
+
+    Only whitelisted tools are accepted. Parameters may sit inside "arguments" or
+    beside it; unknown keys (e.g. "thought") are dropped, conflicting duplicates and
+    missing required parameters are rejected with an explicit message.
+    """
     kind = action.get("action")
     if kind == "final":
-        return action
+        return {
+            k: action[k] for k in ("action", "type", "answer", "reason") if k in action
+        }
     if kind == "tool":
         name = action.get("name")
-        arguments = action.get("arguments", {})
-        if set(action) - {"action", "name", "arguments"}:
-            raise ValueError("Put tool parameters inside arguments")
+        extras = {
+            k: v for k, v in action.items() if k not in {"action", "name", "arguments"}
+        }
     elif isinstance(kind, str) and kind in TOOL_NAMES:
+        # Flat form: "name" is the load_table destination table, not the tool.
         name = kind
-        if "arguments" in action:
-            if set(action) - {"action", "arguments"}:
-                raise ValueError("Use either flat parameters or arguments, not both")
-            arguments = action["arguments"]
-        else:
-            # name is the destination table name for load_table, not the tool name.
-            arguments = {k: v for k, v in action.items() if k != "action"}
+        extras = {k: v for k, v in action.items() if k not in {"action", "arguments"}}
     else:
-        raise ValueError("Unknown action; choose a documented tool or final")
+        raise ProtocolError(
+            f'Unknown action {kind!r}; use "tool" (with a name from {sorted(TOOL_NAMES)}) or "final"'
+        )
     if not isinstance(name, str) or name not in TOOL_NAMES:
-        raise ValueError("Unknown tool")
+        raise ProtocolError(
+            f"Unknown tool {name!r}; choose one of {sorted(TOOL_NAMES)}"
+        )
+    arguments = action.get("arguments", {})
+    if arguments is None:
+        arguments = {}
     if not isinstance(arguments, dict):
-        raise TypeError("arguments must be an object")
-    arguments = dict(arguments)
-    if name == "list_files":
-        # Listing is always scoped to the current business. A path cannot broaden it.
-        arguments.pop("path", None)
-    return {"action": "tool", "name": name, "arguments": arguments}
+        raise ProtocolError("arguments must be a JSON object")
+    merged = dict(arguments)
+    for key, value in extras.items():
+        if key in merged and merged[key] != value:
+            raise ProtocolError(f"Parameter {key!r} given twice with different values")
+        merged[key] = value
+    required, optional = TOOL_PARAMS[name]
+    merged = {k: v for k, v in merged.items() if k in required or k in optional}
+    for key in INTEGER_PARAMS & set(merged):
+        value = merged[key]
+        if isinstance(value, str) and re.fullmatch(r"-?\d+", value.strip()):
+            merged[key] = int(value)
+    missing = [k for k in required if merged.get(k) in (None, "")]
+    if missing:
+        raise ProtocolError(f"{name} requires {list(required)}; missing {missing}")
+    return {"action": "tool", "name": name, "arguments": merged}

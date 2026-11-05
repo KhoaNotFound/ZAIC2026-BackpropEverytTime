@@ -3,6 +3,7 @@
 import argparse
 import hashlib
 import json
+import os
 import random
 import statistics
 import time
@@ -10,6 +11,15 @@ from collections import defaultdict
 from pathlib import Path
 
 from zaic.formats import read_jsonl
+
+# Must be set before torch initializes CUDA: reduces fragmentation OOM on 15 GiB T4s.
+os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
+
+
+def question_seed(seed, question_id):
+    """Stable per-question sampling seed, independent of order and of resumes."""
+    digest = hashlib.sha256(f"{seed}:{question_id}".encode()).digest()
+    return int.from_bytes(digest[:4], "big") & 0x7FFFFFFF
 
 
 def select_questions(questions, limit, seed, sampling):
@@ -51,8 +61,17 @@ def parser():
         help="split: explicit decoder-layer partition across >=2 GPUs; auto/balanced: library placement; cuda:0: one GPU",
     )
     p.add_argument("--gpu-memory-gib", type=int, default=13)
-    p.add_argument("--context-tokens", type=int, default=16384)
+    p.add_argument("--context-tokens", type=int, default=32768)
     p.add_argument("--max-new-tokens", type=int, default=2048)
+    p.add_argument(
+        "--temperature",
+        type=float,
+        default=0.7,
+        help="Qwen non-thinking preset 0.7/0.8/20; 0 = greedy (prone to repetition loops)",
+    )
+    p.add_argument("--top-p", type=float, default=0.8)
+    p.add_argument("--top-k", type=int, default=20)
+    p.add_argument("--repetition-penalty", type=float, default=1.0)
     p.add_argument("--thinking", action="store_true")
     p.add_argument(
         "--prefill-chunk-size",
@@ -91,6 +110,8 @@ def main():
             args.context_tokens - 1,
             args.max_new_tokens - 1,
             args.prefill_chunk_size,
+            args.temperature,
+            args.top_k,
         )
         < 0
     ):
@@ -189,6 +210,10 @@ def main():
         args.thinking,
         args.gpu_memory_gib,
         args.prefill_chunk_size,
+        args.temperature,
+        args.top_p,
+        args.top_k,
+        args.repetition_penalty,
     )
     import importlib.metadata
 
@@ -222,6 +247,8 @@ def main():
     ):
         for i, q in enumerate(pending, 1):
             backend.reset_peak()
+            if hasattr(backend, "set_seed"):
+                backend.set_seed(question_seed(args.seed, q["id"]))
             prediction, detail = answer_question(
                 backend, args.data_dir, q, max_steps=args.max_steps
             )
@@ -242,7 +269,7 @@ def main():
             out.flush()
             print(
                 f"[{i}/{len(pending)}] {q['id']} {detail['status']} {prediction['type']} "
-                f"{detail['elapsed_seconds']:.1f}s",
+                f"{detail['steps']} steps {detail['elapsed_seconds']:.1f}s",
                 flush=True,
             )
             if args.question:

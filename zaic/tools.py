@@ -10,7 +10,7 @@ import time
 from contextlib import closing
 from pathlib import Path
 
-from .formats import TOOL_NAMES
+from .formats import TOOL_NAMES, TOOL_PARAMS
 
 TOOL_HELP = """Tools (one call per turn):
 list_files {} -> paths relative to current business directory.
@@ -27,6 +27,9 @@ query_sqlite {"path":"pos.sqlite","sql":"SELECT ..."} -> read-only SQLite query.
 Queries return at most 100 rows and have a time limit. Aggregate over full tables, not previews.
 DuckDB SQL can join loaded tables. SQL has no external file/network access.
 Use quoted column identifiers, normalize date/number formats based on observed data.
+Numbers stored as text: REPLACE(text, search, replacement) takes the column FIRST, e.g.
+  SUM(CAST(REPLACE("Tổng tiền", ',', '') AS DECIMAL(18,2))). TRY_CAST(x AS ...) gives NULL
+  instead of failing on bad cells; check previews for thousand separators and date formats.
 """
 
 
@@ -52,6 +55,7 @@ class Tools:
             raise ValueError(f"Unknown business: {business_id}")
         self.timeout = timeout
         self.db = None
+        self.tables = {}  # load_table name -> column list, for error feedback
 
     def resolve(self, path):
         if path in ("rulebook.md", "calendar.csv"):
@@ -76,7 +80,19 @@ class Tools:
             raise ValueError("Unknown tool")
         if not isinstance(args, dict):
             raise TypeError("arguments must be an object")
+        required, optional = TOOL_PARAMS[name]
+        unknown = set(args) - set(required) - set(optional)
+        missing = [k for k in required if k not in args]
+        if unknown or missing:
+            raise TypeError(
+                f"{name} takes required {list(required)} and optional {list(optional)}; "
+                f"got {sorted(args)}"
+            )
         return getattr(self, name)(**args)
+
+    def describe_tables(self):
+        """Tables loaded so far in this question and their columns."""
+        return dict(self.tables)
 
     def list_files(self):
         return [
@@ -191,6 +207,7 @@ class Tools:
             cols.append(col)
         frame.columns = cols
         self.connection().register(name, frame)
+        self.tables[name] = cols
         return {
             "table": name,
             "rows": len(frame),

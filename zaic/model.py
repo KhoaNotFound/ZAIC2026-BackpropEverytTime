@@ -2,6 +2,8 @@
 
 import time
 
+from .formats import first_json_object, strip_reasoning
+
 
 class ContextLimitError(RuntimeError):
     """Prompt plus output budget exceeds --context-tokens for one question.
@@ -42,6 +44,38 @@ def make_split_map(module_names, num_layers, gpu_count, tied_embeddings=False):
     return mapping
 
 
+def reply_complete(text, thinking):
+    """True once the reply holds a complete action JSON object (generation can stop)."""
+    if thinking and "</think>" not in text:
+        return False
+    return first_json_object(strip_reasoning(text)) is not None
+
+
+def make_json_stop(tokenizer, prompt_tokens, thinking):
+    """StoppingCriteria that ends generation after the first complete JSON object.
+
+    Without it a finished action is followed by runaway text up to max_new_tokens,
+    which costs minutes per step and corrupts the parse.
+    """
+    import torch
+    from transformers import StoppingCriteria, StoppingCriteriaList
+
+    class JsonStop(StoppingCriteria):
+        def __call__(self, input_ids, scores, **kwargs):
+            done = False
+            last = tokenizer.decode(input_ids[0, -1:], skip_special_tokens=True)
+            if "}" in last:
+                text = tokenizer.decode(
+                    input_ids[0, prompt_tokens:], skip_special_tokens=True
+                )
+                done = reply_complete(text, thinking)
+            return torch.full(
+                (input_ids.shape[0],), done, dtype=torch.bool, device=input_ids.device
+            )
+
+    return StoppingCriteriaList([JsonStop()])
+
+
 class QwenBackend:
     def __init__(
         self,
@@ -53,6 +87,10 @@ class QwenBackend:
         thinking=False,
         gpu_memory_gib=13,
         prefill_chunk_size=512,
+        temperature=0.7,
+        top_p=0.8,
+        top_k=20,
+        repetition_penalty=1.0,
     ):
         import torch
         from transformers import (
@@ -70,6 +108,16 @@ class QwenBackend:
         self.thinking = thinking
         self.model_id = model_id
         self.prefill_chunk_size = prefill_chunk_size or None
+        if temperature > 0:
+            self.sampling = {
+                "do_sample": True,
+                "temperature": temperature,
+                "top_p": top_p,
+                "top_k": top_k,
+            }
+        else:
+            self.sampling = {"do_sample": False}
+        self.sampling["repetition_penalty"] = repetition_penalty
         config = AutoConfig.from_pretrained(model_id)
         text_config = getattr(config, "text_config", config)
         if device_map == "split":
@@ -137,6 +185,11 @@ class QwenBackend:
         for i in range(self.torch.cuda.device_count()):
             self.torch.cuda.reset_peak_memory_stats(i)
 
+    def set_seed(self, seed):
+        """Seed sampling per question so reruns and resumed runs are reproducible."""
+        self.torch.manual_seed(seed)
+        self.torch.cuda.manual_seed_all(seed)
+
     def memory(self):
         return {
             str(i): {
@@ -167,7 +220,10 @@ class QwenBackend:
             output = self.model.generate(
                 **encoded,
                 max_new_tokens=self.max_new_tokens,
-                do_sample=False,
+                **self.sampling,
+                stopping_criteria=make_json_stop(
+                    self.tokenizer, input_tokens, self.thinking
+                ),
                 use_cache=True,
                 cache_implementation="dynamic",
                 prefill_chunk_size=self.prefill_chunk_size,
