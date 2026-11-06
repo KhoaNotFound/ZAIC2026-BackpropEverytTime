@@ -94,6 +94,10 @@ def parser():
     p.add_argument("--output", type=Path, default=Path("outputs/predictions.jsonl"))
     p.add_argument("--resume", action="store_true")
     p.add_argument(
+        "--evaluate", action="store_true",
+        help="After inference, compare saved predictions with this split's answers.jsonl",
+    )
+    p.add_argument(
         "--dry-run",
         action="store_true",
         help="Validate/select source inputs without loading the model",
@@ -103,6 +107,8 @@ def parser():
 
 def main():
     args = parser().parse_args()
+    if args.evaluate and (args.question or not (args.data_dir / "answers.jsonl").is_file()):
+        raise SystemExit("--evaluate requires dataset questions and answers.jsonl")
     if (
         min(
             args.limit,
@@ -171,7 +177,7 @@ def main():
     config = {
         k: str(v) if isinstance(v, Path) else v
         for k, v in vars(args).items()
-        if k not in {"resume", "dry_run", "limit"}
+        if k not in {"resume", "dry_run", "limit", "evaluate"}
     }
     config["selected_ids"] = [q["id"] for q in questions]
     # Include source file hashes to prevent resuming against changed questions/rules.
@@ -196,6 +202,8 @@ def main():
     pending = [q for q in questions if q["id"] not in done]
     if not pending:
         print("All selected questions already completed.")
+        if args.evaluate:
+            evaluate_output(args)
         return
     from zaic.agent import answer_question
     from zaic.model import QwenBackend
@@ -272,8 +280,7 @@ def main():
                 f"{detail['steps']} steps {detail['elapsed_seconds']:.1f}s",
                 flush=True,
             )
-            if args.question:
-                print(json.dumps(prediction, ensure_ascii=False, indent=2))
+            print(json.dumps(prediction, ensure_ascii=False), flush=True)
             if detail["status"] == "error":
                 stopped_on_error = True
                 print(
@@ -299,8 +306,18 @@ def main():
         json.dumps(summary, ensure_ascii=False, indent=2) + "\n"
     )
     print(json.dumps(summary, ensure_ascii=False, indent=2))
+    if args.evaluate:
+        evaluate_output(args)
     if stopped_on_error:
         raise SystemExit(1)
+
+
+def evaluate_output(args):
+    from evaluate import evaluate_run
+
+    evaluate_run(
+        args.output, args.data_dir / "answers.jsonl", args.data_dir / "questions.jsonl"
+    )
 
 
 if __name__ == "__main__":

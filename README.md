@@ -216,7 +216,16 @@ python inference.py \
 - `predictions.traces.jsonl`: phản hồi model, lời gọi tool, kết quả/lỗi.
 - `predictions.metrics.jsonl`: thời gian/token/VRAM theo câu, không có toàn bộ trace.
 - `predictions.summary.json`: thống kê thời gian cho phần chạy trong session hiện tại; ngoại suy null nếu có lỗi thực thi.
-- `predictions.evaluation.json`: benchmark do `evaluate.py` tạo: accuracy, coverage, score theo tổng/loại đáp án/cửa hàng, kết quả từng câu, và `runtime` (trạng thái ok/stalled/max_steps/error, kết quả theo trạng thái, thời gian, số bước, tool call, token, VRAM đỉnh mỗi GPU, thời gian nạp model).
+- `predictions.evaluation.json`: benchmark do `evaluate.py` tạo: accuracy, coverage, score theo tổng/loại đáp án/cửa hàng, và `runtime`. Mỗi phần tử `details` chứa câu hỏi (nếu cung cấp), `prediction` được chấm, `expected` từ đáp án đúng, `outcome` (correct/incorrect/abstained), `points` (+1/-1/0), và `harness_status` nếu có metrics. Câu chưa có prediction được ghi `null` và tính abstain.
+
+Log inference in đáp án sau mỗi câu. `ok number` chỉ nghĩa là agent đã trả final hợp lệ có kiểu số, chưa khẳng định đáp án đúng. Để tự đối chiếu với `answers.jsonl` và in điểm cùng kết quả từng câu ngay sau inference:
+
+```bash
+python inference.py --data-dir data/train --limit 20 \
+  --output outputs/benchmark/predictions.jsonl --evaluate
+```
+
+`--evaluate` chỉ dùng với câu hỏi trong dataset có đáp án; cũng có thể thêm khi `--resume` một run đã hoàn thành. Đáp án đúng chỉ được bộ chấm đọc sau inference, không được đưa vào model/tool. Bộ chấm dùng chính predictions đã lưu, không thay bằng kết quả SQL hoặc sửa đáp án model. Khi harness không nhận được final hợp lệ, prediction là abstain; phản hồi gốc và final bị từ chối vẫn nằm trong trace.
 
 Lưu sau từng câu để tiếp tục được. Nếu tiến trình dừng giữa lúc ghi một dòng JSONL, sửa/bỏ dòng cuối không hoàn chỉnh trước khi resume; parser báo lỗi thay vì bỏ qua dữ liệu hỏng. Trace có thể chứa thông tin kinh doanh và khách hàng, cần giữ cùng phạm vi truy cập với dữ liệu nguồn.
 

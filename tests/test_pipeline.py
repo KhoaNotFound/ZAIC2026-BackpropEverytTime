@@ -166,6 +166,10 @@ def test_score_scope_and_abstention():
     assert report["overall"]["score"] == 0
     assert report["overall"]["abstained"] == 1
     assert report["overall"]["accuracy"] == pytest.approx(1 / 3)
+    assert [d["points"] for d in report["details"]] == [1, -1, 0]
+    assert report["details"][1]["prediction"] == predictions[1]
+    assert report["details"][1]["expected"] == answers[1]
+    assert report["details"][2]["prediction"] is None
     with pytest.raises(ValueError):
         score([{"id": "unknown"}], answers)
 
@@ -246,7 +250,10 @@ def test_parse_and_duplicate_ids(tmp_path):
         read_jsonl(path)
 
 
-def test_cli_checkpoint_resume_and_evaluation(source, tmp_path, monkeypatch):
+@pytest.mark.parametrize("evaluate_after", [False, True])
+def test_cli_checkpoint_resume_and_evaluation(
+    source, tmp_path, monkeypatch, capsys, evaluate_after
+):
     import importlib.metadata
     import sys
 
@@ -291,12 +298,22 @@ def test_cli_checkpoint_resume_and_evaluation(source, tmp_path, monkeypatch):
         "--output",
         str(output),
     ]
+    if evaluate_after:
+        argv.append("--evaluate")
     monkeypatch.setattr(sys, "argv", argv)
     inference.main()
     assert read_jsonl(output)[0]["answer"] == 300
-    monkeypatch.setattr(sys, "argv", argv + ["--resume"])
+    assert '"answer": 300' in capsys.readouterr().out
+    assert output.with_suffix(".evaluation.json").exists() == evaluate_after
+    monkeypatch.setattr(sys, "argv", argv + ["--resume", "--evaluate"])
     inference.main()
     assert len(read_jsonl(output)) == 1
+    report = json.loads(output.with_suffix(".evaluation.json").read_text())
+    detail = report["details"][0]
+    assert detail["prediction"] == detail["expected"] == read_jsonl(output)[0]
+    assert detail["question"] == q["question"]
+    assert detail["outcome"] == "correct" and detail["points"] == 1
+    assert detail["harness_status"] == "ok"
     monkeypatch.setattr(
         sys,
         "argv",
@@ -401,6 +418,12 @@ def test_cli_stops_on_runtime_error_without_time_extrapolation(
     (source / "questions.jsonl").write_text(
         "".join(json.dumps(q) + "\n" for q in questions)
     )
+    (source / "answers.jsonl").write_text(
+        "".join(
+            json.dumps({"id": q["id"], "type": "number", "answer": 300}) + "\n"
+            for q in questions
+        )
+    )
 
     class BrokenBackend:
         def __init__(self, *args):
@@ -427,6 +450,7 @@ def test_cli_stops_on_runtime_error_without_time_extrapolation(
             str(source),
             "--limit",
             "2",
+            "--evaluate",
             "--output",
             str(output),
         ],
@@ -435,6 +459,10 @@ def test_cli_stops_on_runtime_error_without_time_extrapolation(
         inference.main()
     assert exc.value.code == 1
     assert len(read_jsonl(output)) == 1
+    report = json.loads(output.with_suffix(".evaluation.json").read_text())
+    assert report["overall"]["abstained"] == 2
+    assert {d["harness_status"] for d in report["details"]} == {"error", "not_run"}
+    assert sum(d["prediction"] is None for d in report["details"]) == 1
     summary = json.loads(output.with_suffix(".summary.json").read_text())
     assert summary["stopped_on_error"] is True
     assert summary["selected_but_not_completed"] == 1

@@ -113,7 +113,17 @@ def score(predictions, answers, ids=None, questions=None):
         by_type[gold["type"]][outcome] += 1
         if ident in qmap:
             by_business[qmap[ident]["business_id"]][outcome] += 1
-        details.append({"id": ident, "outcome": outcome, "expected_type": gold["type"]})
+        details.append(
+            {
+                "id": ident,
+                "question": qmap.get(ident, {}).get("question"),
+                "outcome": outcome,
+                "points": {"correct": 1, "incorrect": -1, "abstained": 0}[outcome],
+                "expected_type": gold["type"],
+                "prediction": pred,
+                "expected": gold,
+            }
+        )
 
     def summarize(c):
         n = sum(c.values())
@@ -157,6 +167,7 @@ def runtime(metrics, details, manifest=None):
     outcome_by_status = defaultdict(Counter)
     for d in details:
         status = by_id.get(d["id"], {}).get("status", "not_run")
+        d["harness_status"] = status
         outcome_by_status[status][d["outcome"]] += 1
     peak = defaultdict(lambda: {"allocated_peak_gib": 0.0, "reserved_peak_gib": 0.0})
     for m in metrics:
@@ -196,6 +207,9 @@ def print_report(report):
             f"  {kind:<13} {s['correct']:>3}/{s['total']:<3} correct  "
             f"{s['incorrect']:>3} incorrect  {s['abstained']:>3} abstained"
         )
+    print("Per-question comparison (prediction vs expected):")
+    for detail in report["details"]:
+        print(json.dumps(detail, ensure_ascii=False))
     r = report.get("runtime")
     if not r:
         return
@@ -221,6 +235,37 @@ def print_report(report):
         )
 
 
+def evaluate_run(predictions_path, answers_path, questions_path=None, scope="run", output=None):
+    """Score saved predictions against labels only after inference has finished."""
+    preds, golds = read_jsonl(predictions_path), read_jsonl(answers_path)
+    manifest_path = predictions_path.with_suffix(".run.json")
+    if scope == "run":
+        if not manifest_path.exists():
+            raise SystemExit(
+                "Missing .run.json manifest. Use --scope predictions or --scope all explicitly."
+            )
+        ids = json.loads(manifest_path.read_text())["config"]["selected_ids"]
+    else:
+        ids = [v["id"] for v in preds] if scope == "predictions" else None
+    report = score(
+        preds, golds, ids, read_jsonl(questions_path) if questions_path else None
+    )
+    metrics_path = predictions_path.with_suffix(".metrics.jsonl")
+    if metrics_path.exists():
+        manifest = (
+            json.loads(manifest_path.read_text()) if manifest_path.exists() else None
+        )
+        report["runtime"] = runtime(
+            read_jsonl(metrics_path), report["details"], manifest
+        )
+    output = output or predictions_path.with_suffix(".evaluation.json")
+    output.parent.mkdir(parents=True, exist_ok=True)
+    output.write_text(json.dumps(report, ensure_ascii=False, indent=2) + "\n")
+    print_report(report)
+    print(f"Details: {output}")
+    return report
+
+
 def main():
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument("--predictions", type=Path, required=True)
@@ -234,33 +279,7 @@ def main():
     )
     p.add_argument("--output", type=Path)
     args = p.parse_args()
-    preds, golds = read_jsonl(args.predictions), read_jsonl(args.answers)
-    if args.scope == "run":
-        manifest = args.predictions.with_suffix(".run.json")
-        if not manifest.exists():
-            raise SystemExit(
-                "Missing .run.json manifest. Use --scope predictions or --scope all explicitly."
-            )
-        ids = json.loads(manifest.read_text())["config"]["selected_ids"]
-    else:
-        ids = [v["id"] for v in preds] if args.scope == "predictions" else None
-    report = score(
-        preds, golds, ids, read_jsonl(args.questions) if args.questions else None
-    )
-    metrics_path = args.predictions.with_suffix(".metrics.jsonl")
-    if metrics_path.exists():
-        manifest_path = args.predictions.with_suffix(".run.json")
-        manifest = (
-            json.loads(manifest_path.read_text()) if manifest_path.exists() else None
-        )
-        report["runtime"] = runtime(
-            read_jsonl(metrics_path), report["details"], manifest
-        )
-    output = args.output or args.predictions.with_suffix(".evaluation.json")
-    output.parent.mkdir(parents=True, exist_ok=True)
-    output.write_text(json.dumps(report, ensure_ascii=False, indent=2) + "\n")
-    print_report(report)
-    print(f"Details: {output}")
+    evaluate_run(args.predictions, args.answers, args.questions, args.scope, args.output)
 
 
 if __name__ == "__main__":
