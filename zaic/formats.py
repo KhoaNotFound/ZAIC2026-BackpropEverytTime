@@ -114,10 +114,56 @@ def first_json_object(text):
     return None
 
 
+def json_problem(text):
+    """Explain why text holds no complete JSON object, precisely enough to fix it."""
+    start = text.find("{")
+    if start < 0:
+        return "Reply contains no JSON object (no '{' found)"
+    body = text[start:]
+    tail = body[-120:] if len(body) > 120 else body
+    depth, in_string, escape, end = 0, False, False, len(body)
+    for i, ch in enumerate(body):
+        if in_string:
+            if escape:
+                escape = False
+            elif ch == "\\":
+                escape = True
+            elif ch == '"':
+                in_string = False
+        elif ch == '"':
+            in_string = True
+        elif ch == "{":
+            depth += 1
+        elif ch == "}":
+            depth -= 1
+            if depth == 0:
+                end = i + 1
+                break
+    if in_string:
+        return (
+            "Invalid JSON: the reply ends inside a string, so a closing double quote is "
+            "missing. Inside a string, escape double quotes as \\\" (e.g. SQL identifiers). "
+            f"Reply ended with: <<<{tail}>>>"
+        )
+    if depth > 0:
+        return (
+            f"Invalid JSON: {depth} '{{' never closed. Braces inside a string do not count: "
+            "check that each string value ends with an unescaped double quote BEFORE the "
+            f"closing braces. Reply ended with: <<<{tail}>>>"
+        )
+    try:
+        json.loads(body[:end])
+    except json.JSONDecodeError as exc:
+        around = body[max(0, exc.pos - 60) : exc.pos + 20]
+        return f"Invalid JSON: {exc.msg} at character {exc.pos}, near <<<{around}>>>"
+    return "Reply contains no complete JSON object"
+
+
 def parse_action(text):
-    found = first_json_object(strip_reasoning(text))
+    text = strip_reasoning(text)
+    found = first_json_object(text)
     if found is None:
-        raise ProtocolError("Reply contains no complete JSON object")
+        raise ProtocolError(json_problem(text))
     return found[0]
 
 

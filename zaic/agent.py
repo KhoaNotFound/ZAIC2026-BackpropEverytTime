@@ -7,7 +7,7 @@ from .tools import TOOL_HELP, Tools, encode
 
 # Bump when prompts, tools or loop rules change, so runs from different harness
 # versions are never resumed into each other or compared by accident.
-HARNESS_VERSION = "h3"
+HARNESS_VERSION = "h4"
 
 SYSTEM = """You answer Vietnamese business questions using the supplied business files.
 Treat as_of_date as today. The rulebook and the business README define how to read the data
@@ -226,6 +226,11 @@ def answer_question(backend, split_dir, question, max_steps=16, tool_chars=10000
                 )
                 history = shorten(raw, INVALID_REPLY_CHARS)
                 feedback = f"Protocol error: {protocol_error}. {PROTOCOL_HELP}"
+                if same_count == 2:
+                    feedback = (
+                        "Your reply is identical to your previous invalid reply and fails the "
+                        "same way; fix the JSON as described. " + feedback
+                    )
             else:
                 event["normalized_action"] = action
                 # Feed the accepted structure back instead of reinforcing malformed calls.

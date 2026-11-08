@@ -972,3 +972,25 @@ def test_chat_template_without_system_role_falls_back():
         thinking=False,
     )
     assert text == "S\n\nU"
+
+
+def test_protocol_errors_explain_broken_json(source):
+    from zaic.formats import ProtocolError
+
+    # Observed from Qwen3.5-9B: the sql string's closing quote lands after the braces.
+    broken = (
+        '{"action": "run_sql", "arguments": {"sql": "SELECT SUM(CAST(\\"Tiền\\" AS INT)) '
+        "FROM sales WHERE \\\"Trạng thái\\\" = 'ok'}}\" "
+    )
+    with pytest.raises(ProtocolError, match="2 '\\{' never closed.*BEFORE the closing braces"):
+        parse_action(broken)
+    with pytest.raises(ProtocolError, match="ends inside a string"):
+        parse_action('{"action":"run_sql","arguments":{"sql":"SELECT 1')
+    with pytest.raises(ProtocolError, match="trailing comma"):
+        parse_action('{"action":"final","type":"number","answer":1,}')
+    backend = ScriptedBackend([broken, broken, '{"action":"final","type":"abstain"}'])
+    prediction, detail = ask(backend, source)
+    assert detail["status"] == "ok" and prediction["type"] == "abstain"
+    assert "never closed" in detail["trace"][0]["feedback"]
+    assert detail["trace"][1]["feedback"].startswith("Your reply is identical")
+    assert "<<<" in backend.prompts[1]
