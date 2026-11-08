@@ -94,6 +94,32 @@ def model_class(config):
     return AutoModelForCausalLM, config
 
 
+def quantization_config(quantization):
+    """bitsandbytes settings, shared by online loading and scripts/prepare_model.py."""
+    import torch
+    from transformers import BitsAndBytesConfig
+
+    if quantization == "4bit":
+        return BitsAndBytesConfig(
+            load_in_4bit=True,
+            bnb_4bit_quant_type="nf4",
+            bnb_4bit_use_double_quant=True,
+            bnb_4bit_compute_dtype=torch.float16,
+        )
+    if quantization == "8bit":
+        return BitsAndBytesConfig(load_in_8bit=True)
+    return None
+
+
+def is_prequantized(config):
+    """True for checkpoints saved already quantized (e.g. by scripts/prepare_model.py)."""
+    return any(
+        getattr(c, "quantization_config", None)
+        for c in (config, getattr(config, "text_config", None))
+        if c is not None
+    )
+
+
 def chat_text(tokenizer, messages, thinking):
     """Apply the model's chat template; fold the system prompt into the first user
     turn for templates that reject a system role."""
@@ -181,7 +207,7 @@ class HFBackend:
         prefix_cache=True,
     ):
         import torch
-        from transformers import AutoConfig, AutoTokenizer, BitsAndBytesConfig
+        from transformers import AutoConfig, AutoTokenizer
 
         if not torch.cuda.is_available():
             raise RuntimeError("CUDA GPU required. Enable T4 GPUs in Kaggle settings.")
@@ -242,15 +268,14 @@ class HFBackend:
                 i: f"{gpu_memory_gib}GiB" for i in range(torch.cuda.device_count())
             }
             kwargs["max_memory"]["cpu"] = "8GiB"
-        if quantization == "4bit":
-            kwargs["quantization_config"] = BitsAndBytesConfig(
-                load_in_4bit=True,
-                bnb_4bit_quant_type="nf4",
-                bnb_4bit_use_double_quant=True,
-                bnb_4bit_compute_dtype=torch.float16,
-            )
-        elif quantization == "8bit":
-            kwargs["quantization_config"] = BitsAndBytesConfig(load_in_8bit=True)
+        if is_prequantized(config):
+            # Weights were quantized when saved; loading skips quantization entirely.
+            print("Loading pre-quantized checkpoint; --quantization is ignored", flush=True)
+            self.quantization = "prequantized"
+        else:
+            self.quantization = quantization
+            if quantization_config(quantization) is not None:
+                kwargs["quantization_config"] = quantization_config(quantization)
         # For Qwen3.5 the text-only loader maps language-model weights from the
         # multimodal checkpoint without instantiating the unused vision tower.
         self.model = cls.from_pretrained(model_id, config=load_config, **kwargs).eval()

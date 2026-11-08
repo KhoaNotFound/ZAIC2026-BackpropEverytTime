@@ -10,7 +10,7 @@ The goal is to measure how many questions the pretrained Qwen3.5-9B model, witho
 
 1. Create a new Kaggle notebook. In **Session options** on the right:
    - **Accelerator**: select **GPU T4 x2** (two GPUs are required for the default configuration).
-   - **Internet**: turn it **On** to clone the repository and download Qwen weights from Hugging Face.
+   - **Internet**: turn it **On** to clone the repository (and, without the prepare notebook's output, to download Qwen weights).
 2. Attach the dataset: **Add Input** → **Your Work** / **Datasets** → select your uploaded dataset → **Add**.
 3. The dataset must contain a training directory with this structure:
 
@@ -36,97 +36,30 @@ Kaggle mounts datasets read-only under `/kaggle/input/`. The directory name is t
 
 The training path is the directory containing `questions.jsonl`, for example `/kaggle/input/<slug>/train`. You can also select the directory in the **Input** panel on the right and use the copy icon to copy its path.
 
-### 3. Import the repository notebook
+### 3. Prepare the model and libraries once (`kaggle_prepare.ipynb`)
 
-Download [notebooks/kaggle_inference.ipynb](notebooks/kaggle_inference.ipynb) from GitHub, then select **File → Import Notebook** on Kaggle and upload it. Alternatively, create the cells below, following the notebook workflow.
+Import [notebooks/kaggle_prepare.ipynb](notebooks/kaggle_prepare.ipynb) (**File → Import Notebook**), select a **GPU T4** accelerator with **Internet On** (no dataset needed), and run it with **Save Version → Save & Run All (Commit)**. It takes roughly 10–20 minutes and writes about 7 GB to `/kaggle/working`:
 
-### 4. Run the cells in order
+- `qwen3.5-9b-nf4/`: the text-only Qwen3.5-9B decoder already quantized to NF4 with exactly the settings inference uses online (`zaic.model.quantization_config`), plus the tokenizer and a `zaic_model.json` provenance file. It is produced by `scripts/prepare_model.py`, which reloads the saved directory as inference does and generates once (`--verify`).
+- `wheels/`: the Python packages the Kaggle image is missing (`scripts/download_wheels.py` asks pip which packages `requirements.txt` would add, skipping torch and CUDA libraries), installed offline with `pip install --no-index --no-deps`.
 
-**Cell 1: configuration.** Set `LIMIT` to the number of questions to try (`0` means all questions). Leave `DATA_DIR = ""` for automatic discovery. `OUTPUT` incorporates `LIMIT`, `SEED`, and `CONTEXT_TOKENS`, giving those configurations separate directories to avoid an "Output exists" error when switching between them.
+Rerun it only when changing the model or quantization, or when Kaggle updates its image (the inference notebook falls back to an online `pip install` if the wheels no longer fit).
 
-```python
-REPO_URL = "https://github.com/KhoaNotFound/ZAIC2026-BackpropEverytTime.git"
-DATA_DIR = ""  # Leave empty to discover the training directory under /kaggle/input.
-LIMIT = 1      # Number of questions to try; 0 = all.
-SEED = 42
-CONTEXT_TOKENS = 32768  # Input + output tokens per step.
-RESUME = False
-# ... find_train_dirs() resolves DATA_DIR automatically (see the notebook), then:
-OUTPUT = f"/kaggle/working/qwen_train_limit{LIMIT}_seed{SEED}_ctx{CONTEXT_TOKENS}/predictions.jsonl"
-```
+### 4. Run the benchmark (`kaggle_inference.ipynb`)
 
-**Cell 2: clone or update the repository and install dependencies.** The first run clones the repository; later runs use `git pull` to get the latest code.
+Import [notebooks/kaggle_inference.ipynb](notebooks/kaggle_inference.ipynb), select **GPU T4 x2**, and attach two inputs: the dataset with the training split, and **Add Input → Your Work → Notebooks →** the prepare notebook. Internet is only needed to clone the repository. Only the first cell needs editing:
 
-```python
-import subprocess
-from pathlib import Path
-repo = Path("/kaggle/working/zAIC")
-if not repo.exists():
-    subprocess.run(["git", "clone", REPO_URL, str(repo)], check=True)
-else:
-    subprocess.run(["git", "-C", str(repo), "pull", "--ff-only"], check=True)
-%cd /kaggle/working/zAIC
-%pip install -r requirements.txt
-```
+1. **Configuration**: `LIMIT`, `SEED`, `CONTEXT_TOKENS`, `TEMPERATURE`, `HARNESS`, `RESUME`. `DATA_DIR`, `MODEL_DIR` (a directory containing `zaic_model.json`) and the wheel directory are discovered under `/kaggle/input`. Without a prepared model it falls back to downloading `Qwen/Qwen3.5-9B` and quantizing while loading, which is much slower. `OUTPUT` encodes model, harness, `LIMIT`, `SEED`, context and temperature, so changed configurations never collide.
+2. **Setup**: clone or pull the repository, install the prepared wheels offline, print library versions and GPUs. Inference runs in a subprocess, so no kernel restart is needed after installing.
+3. **Run**: a dry run validates the data without loading the model, then `inference.py --evaluate` runs the sample and scores it immediately. With a local model, `HF_HUB_OFFLINE=1` prevents any Hugging Face access. Logs show the device map, per-GPU VRAM after loading, and `[i/n] id status type ...` per question.
+4. **Results**: prints the summary and the benchmark without per-question details (those are in `predictions.evaluation.json`).
 
-If pip upgrades a library that is already imported, commonly `transformers`, **restart the kernel**, rerun Cell 1, and continue from Cell 3. You do not need to rerun Cell 2. Preserve Kaggle's existing CUDA-enabled PyTorch installation. The public Qwen checkpoint does not require an API key.
-
-**Cell 3: check the GPUs.** Expect two `Tesla T4` entries with approximately 14.7 GiB each.
-
-```python
-import torch
-print("PyTorch:", torch.__version__, "CUDA:", torch.cuda.is_available())
-for i in range(torch.cuda.device_count()):
-    props = torch.cuda.get_device_properties(i)
-    print(i, props.name, round(props.total_memory / 2**30, 2), "GiB")
-```
-
-**Cell 4: dry run.** Validate the data and print the selected questions without loading the model.
-
-```python
-import subprocess, sys, os
-os.chdir("/kaggle/working/zAIC")
-assert (Path(DATA_DIR) / "answers.jsonl").is_file(), "DATA_DIR must point to the training split with answers.jsonl"
-base = [sys.executable, "inference.py", "--data-dir", DATA_DIR, "--limit", str(LIMIT),
-        "--seed", str(SEED), "--output", OUTPUT]
-subprocess.run(base + ["--dry-run"], check=True)
-```
-
-**Cell 5: inference on two GPUs.** `--device-map split` places 16 decoder layers on GPU 0 and 16 on GPU 1. Logs show the device map and per-GPU VRAM after loading, followed by progress for each question (`[i/n] id status type ...`). The first weight download can take several minutes.
-
-```python
-import torch
-assert torch.cuda.device_count() >= 2, "Two GPUs are required: select the GPU T4 x2 accelerator"
-command = base + ["--model", "Qwen/Qwen3.5-9B", "--quantization", "4bit", "--device-map", "split",
-                   "--context-tokens", str(CONTEXT_TOKENS)]
-if RESUME:
-    command += ["--resume"]
-subprocess.run(command, check=True)
-```
-
-**Cell 6: score predictions and print the benchmark.**
-
-```python
-subprocess.run([sys.executable, "evaluate.py", "--predictions", OUTPUT,
-                "--answers", str(Path(DATA_DIR) / "answers.jsonl"),
-                "--questions", str(Path(DATA_DIR) / "questions.jsonl")], check=True)
-```
-
-The benchmark includes correct, incorrect, and abstained counts; accuracy; coverage; attempted accuracy; score (correct +1, incorrect −1, abstain 0); results by answer type; termination statuses such as `ok`, `stalled`, `max_steps`, and `error`; outcomes by status; time, steps, tool calls, and tokens per question; peak VRAM per GPU; and model loading time. The full report, including results by business and per question, is saved to `predictions.evaluation.json`.
-
-**Cell 7: list output files.**
-
-```python
-summary = Path(OUTPUT).with_suffix(".summary.json")
-if summary.exists():
-    print(summary.read_text())
-print("Artifacts:", [p.name for p in Path(OUTPUT).parent.glob("predictions.*")])
-```
+The benchmark includes correct, incorrect, and abstained counts; accuracy; coverage; attempted accuracy; score (correct +1, incorrect −1, abstain 0); results by answer type; termination statuses such as `ok`, `stalled`, `max_steps`, and `error`; outcomes by status; time, steps, tool calls, prompt, prefilled and output tokens per question; peak VRAM per GPU; and model loading time. `predictions.run.json` records `model_source` (from `zaic_model.json`) and `quantization_loaded`.
 
 ### 5. Suggested workflow
 
 1. `LIMIT = 1`: check that the model loads and inspect peak VRAM per GPU in the benchmark.
-2. `LIMIT = 20` (or 50, 100): estimate initial accuracy. Update Cell 1, then rerun Cells 1, 4, 5, and 6.
+2. `LIMIT = 20` (or 50, 100): estimate initial accuracy. Update the first cell, then rerun all cells.
 3. `LIMIT = 0`: run the full training split. The time estimate for 3,000 questions is in `predictions.summary.json`. Kaggle GPU session and weekly usage limits may require multiple sessions with `RESUME = True`.
 4. If a session is interrupted, keep the same configuration in Cell 1, set `RESUME = True`, and rerun. Questions with saved predictions are skipped.
 5. Use **Save Version**, or download the output directory under `/kaggle/working/`, to preserve results before the session ends.

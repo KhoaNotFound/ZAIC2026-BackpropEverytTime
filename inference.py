@@ -257,6 +257,13 @@ def main():
         "versions": versions,
         "load_seconds": time.perf_counter() - load_start,
         "device_map": backend.device_map,
+        "quantization_loaded": getattr(backend, "quantization", None),
+        # Present when --model is a directory saved by scripts/prepare_model.py.
+        "model_source": (
+            json.loads((Path(args.model) / "zaic_model.json").read_text())
+            if (Path(args.model) / "zaic_model.json").is_file()
+            else None
+        ),
         "note": "Inference only; no training loss or weight updates.",
     }
     meta_path.write_text(json.dumps(meta, ensure_ascii=False, indent=2) + "\n")
