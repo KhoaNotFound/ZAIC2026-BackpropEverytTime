@@ -13,7 +13,7 @@ The current Python 3.10+ prototype performs inference and deterministic evaluati
 - `zaic/`: agent loop (`agent.py`), model loading/generation (`model.py`), data tools (`tools.py`), and JSON protocols (`formats.py`).
 - `inference.py`: sampling, inference, and run artifacts; `main.py` delegates to it. `evaluate.py` scores predictions independently.
 - `tests/`: CPU pipeline tests and an optional GPU smoke test.
-- `notebooks/kaggle_inference.ipynb`: Kaggle workflow; `scripts/analyze_data.py`: dataset analysis.
+- `notebooks/kaggle_run.ipynb`: single Kaggle workflow (prepares the NF4 model and wheels on first run, then runs and scores); `scripts/prepare_model.py`, `scripts/download_wheels.py`, `scripts/check_fast_kernels.py`: its helpers; `scripts/analyze_data.py`: dataset analysis.
 - `data/`, `reports/`, and `outputs/`: local datasets and generated artifacts, excluded from Git.
 
 ## Build, Test, and Development Commands
