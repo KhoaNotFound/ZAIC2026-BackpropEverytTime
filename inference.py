@@ -53,7 +53,11 @@ def parser():
         required=True,
         help="Split directory containing questions.jsonl, rulebook.md and data/",
     )
-    p.add_argument("--model", default="Qwen/Qwen3.5-9B")
+    p.add_argument(
+        "--model",
+        default="Qwen/Qwen3.5-9B",
+        help="Any Hugging Face causal LM with a chat template (local path or hub id)",
+    )
     p.add_argument("--quantization", choices=["4bit", "8bit", "none"], default="4bit")
     p.add_argument(
         "--device-map",
@@ -67,7 +71,8 @@ def parser():
         "--temperature",
         type=float,
         default=0.7,
-        help="Qwen non-thinking preset 0.7/0.8/20; 0 = greedy (prone to repetition loops)",
+        help="Defaults are the Qwen non-thinking preset 0.7/0.8/20; use the model card's "
+        "recommended values for other models. 0 = greedy (prone to repetition loops)",
     )
     p.add_argument("--top-p", type=float, default=0.8)
     p.add_argument("--top-k", type=int, default=20)
@@ -78,6 +83,12 @@ def parser():
         type=int,
         default=512,
         help="Process prompt in chunks to reduce peak VRAM; 0 disables chunking",
+    )
+    p.add_argument(
+        "--no-prefix-cache",
+        dest="prefix_cache",
+        action="store_false",
+        help="Re-prefill the whole conversation every step (slower; for debugging)",
     )
     p.add_argument("--max-steps", type=int, default=16)
     p.add_argument("--limit", type=int, default=20, help="0 = all questions")
@@ -179,6 +190,9 @@ def main():
         for k, v in vars(args).items()
         if k not in {"resume", "dry_run", "limit", "evaluate"}
     }
+    from zaic.agent import HARNESS_VERSION
+
+    config["harness_version"] = HARNESS_VERSION
     config["selected_ids"] = [q["id"] for q in questions]
     # Include source file hashes to prevent resuming against changed questions/rules.
     config["source_hashes"] = {
@@ -206,10 +220,10 @@ def main():
             evaluate_output(args)
         return
     from zaic.agent import answer_question
-    from zaic.model import QwenBackend
+    from zaic.model import HFBackend
 
     load_start = time.perf_counter()
-    backend = QwenBackend(
+    backend = HFBackend(
         args.model,
         args.quantization,
         args.device_map,
@@ -222,6 +236,7 @@ def main():
         args.top_p,
         args.top_k,
         args.repetition_penalty,
+        args.prefix_cache,
     )
     import importlib.metadata
 

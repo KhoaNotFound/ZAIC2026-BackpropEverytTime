@@ -86,9 +86,10 @@ def test_excel_raw_header_selection(source):
     wb.save(source / "data/biz_1/sales.xlsx")
     tools = Tools(source, "biz_1")
     try:
-        assert tools.inspect_table("sales.xlsx")[0]["preview"][0][0] == "Báo cáo"
+        assert tools.inspect_table("sales.xlsx")["sheets"][0]["preview"][0][0] == "Báo cáo"
         result = tools.load_table("sales.xlsx", "sales", sheet="Tháng 1", header_row=1)
-        assert result["columns"] == ["Mã", "Tiền"]
+        assert result["columns"] == ["Mã", "Tiền", "_row", "_sheet"]
+        assert result["preview"] == [["A", "125", 2, "Tháng 1"]]
         assert (
             tools.run_sql('select sum(cast("Tiền" as integer)) from sales')["rows"][0][
                 0
@@ -112,7 +113,9 @@ def test_strict_numbers_and_formats():
     )
     assert not valid_answer({"type": "number", "answer": float("nan")})
     assert not valid_answer({"type": "date", "answer": "2026-02-30"})
-    assert not valid_answer({"type": "unanswerable"})
+    # Rulebook §7: reason is optional, but must be a string when present.
+    assert valid_answer({"type": "unanswerable"})
+    assert not valid_answer({"type": "unanswerable", "reason": 1})
     assert not correct(
         {"type": "percent", "answer": 0.124}, {"type": "percent", "answer": 12.4}
     )
@@ -286,7 +289,7 @@ def test_cli_checkpoint_resume_and_evaluation(
         def memory(self):
             return {}
 
-    monkeypatch.setattr(zaic.model, "QwenBackend", FakeBackend)
+    monkeypatch.setattr(zaic.model, "HFBackend", FakeBackend)
     monkeypatch.setattr(importlib.metadata, "version", lambda package: "test")
     output = tmp_path / "out" / "predictions.jsonl"
     argv = [
@@ -438,7 +441,7 @@ def test_cli_stops_on_runtime_error_without_time_extrapolation(
         def generate(self, messages):
             raise RuntimeError("CUDA out of memory")
 
-    monkeypatch.setattr(zaic.model, "QwenBackend", BrokenBackend)
+    monkeypatch.setattr(zaic.model, "HFBackend", BrokenBackend)
     monkeypatch.setattr(importlib.metadata, "version", lambda package: "test")
     output = tmp_path / "failure" / "predictions.jsonl"
     monkeypatch.setattr(
@@ -620,7 +623,7 @@ def test_cli_continues_after_context_limit(source, tmp_path, monkeypatch):
                 raise reply
             return reply, {"input_tokens": 10, "output_tokens": 5}
 
-    monkeypatch.setattr(zaic.model, "QwenBackend", LongPromptBackend)
+    monkeypatch.setattr(zaic.model, "HFBackend", LongPromptBackend)
     monkeypatch.setattr(importlib.metadata, "version", lambda package: "test")
     output = tmp_path / "ctx" / "predictions.jsonl"
     monkeypatch.setattr(
@@ -739,7 +742,7 @@ def test_sql_error_feedback_lists_loaded_columns(source):
     assert prediction["answer"] == 300 and detail["status"] == "ok"
     feedback = detail["trace"][1]["feedback"]
     assert "Tool error from run_sql" in feedback
-    assert '"sales": ["id", "status", "amount"]' in feedback
+    assert '"sales": ["id", "status", "amount", "_row"]' in feedback
     assert "list_files" not in feedback
 
 
@@ -786,3 +789,186 @@ def test_invalid_long_reply_is_shortened_in_history(source):
     assert junk not in backend.prompts[1]
     assert "more characters omitted" in backend.prompts[1]
     assert "SECRET LABEL" not in "".join(backend.prompts)
+
+
+def test_multi_sheet_load_keeps_order_blanks_and_allows_fill_down(source):
+    import datetime as dt
+
+    import openpyxl
+
+    wb = openpyxl.Workbook()
+    first = wb.active
+    first.title = "T01"
+    first.append(["Mã đơn", "Ngày", "Tiền", "Ghi chú"])
+    first.append(["D1", dt.datetime(2025, 1, 2), 1000.0, "  "])
+    first.append([None, None, 2500.5, None])
+    first.append([])  # fully blank row: skipped, numbering kept
+    first.append(["D2", dt.datetime(2025, 1, 3, 8, 30), 300, "x"])
+    second = wb.create_sheet("T02")
+    second.append(["Mã đơn", "Ngày", "Tiền", "Kênh"])
+    second.append(["D3", "05/02/2025", 45689, "web"])
+    second.append([None, None, 10, None])
+    wb.save(source / "data/biz_1/orders.xlsx")
+    tools = Tools(source, "biz_1")
+    try:
+        inspected = tools.inspect_table("orders.xlsx")
+        assert [s["sheet"] for s in inspected["sheets"]] == ["T01", "T02"]
+        assert inspected["sheets"][0]["rows"] == 5
+        # Previews show the same text that load_table stores.
+        assert inspected["sheets"][0]["preview"][1] == ["D1", "2025-01-02", "1000"]
+        assert inspected["sheets"][0]["preview"][2] == [None, None, "2500.5"]
+        assert tools.inspect_table("orders.xlsx", sheet="T02")["sheets"][1]["preview"][1][2] == "45689"
+        with pytest.raises(ValueError, match="T01"):
+            tools.load_table("orders.xlsx", "t", sheet="T03")
+        result = tools.load_table("orders.xlsx", "t", sheet="*")
+        assert result["rows"] == 5
+        assert result["rows_per_sheet"] == {"T01": 3, "T02": 2}
+        assert result["columns"] == ["Mã đơn", "Ngày", "Tiền", "Ghi chú", "Kênh", "_row", "_sheet"]
+        assert "different headers" in result["warning"]
+        rows = tools.run_sql(
+            'SELECT _sheet, _row, "Mã đơn", "Ngày", "Ghi chú" FROM t ORDER BY _sheet, _row'
+        )["rows"]
+        assert rows == [
+            ("T01", 1, "D1", "2025-01-02", None),
+            ("T01", 2, None, None, None),
+            ("T01", 4, "D2", "2025-01-03 08:30:00", "x"),
+            ("T02", 1, "D3", "05/02/2025", None),
+            ("T02", 2, None, None, None),
+        ]
+        # The fill-down pattern documented in TOOL_HELP.
+        filled = tools.run_sql(
+            'WITH g AS (SELECT *, COUNT("Mã đơn") OVER (PARTITION BY _sheet ORDER BY _row) AS grp FROM t) '
+            'SELECT FIRST_VALUE("Mã đơn") OVER (PARTITION BY _sheet, grp ORDER BY _row) AS m, '
+            'CAST("Tiền" AS DECIMAL(18,2)) AS tien FROM g ORDER BY _sheet, _row'
+        )
+        assert [r[0] for r in filled["rows"]] == ["D1", "D1", "D2", "D3", "D3"]
+        assert tools.load_table("orders.xlsx", "two", sheet=["T02", 0])["rows"] == 5
+    finally:
+        tools.close()
+
+
+def test_decimal_sql_results_encode_as_json_numbers(source):
+    from zaic.tools import encode
+
+    tools = Tools(source, "biz_1")
+    try:
+        tools.load_table("sales.csv", "sales")
+        result = tools.run_sql(
+            "SELECT SUM(CAST(amount AS DECIMAL(18,2))) AS s, "
+            "CAST('12.35' AS DECIMAL(18,2)) AS p FROM sales"
+        )
+        assert encode(result["rows"]) == "[[1200, 12.35]]"
+    finally:
+        tools.close()
+
+
+def test_large_inspect_keeps_every_sheet_name(source):
+    import openpyxl
+
+    wb = openpyxl.Workbook()
+    wb.remove(wb.active)
+    for month in range(1, 21):
+        sheet = wb.create_sheet(f"T{month:02d}")
+        sheet.append(["c" * 40 + str(i) for i in range(30)])
+        for _ in range(8):
+            sheet.append(["v" * 40] * 30)
+    wb.save(source / "data/biz_1/big.xlsx")
+    tools = Tools(source, "biz_1")
+    try:
+        from zaic.tools import encode
+
+        result = tools.inspect_table("big.xlsx")
+        assert [s["sheet"] for s in result["sheets"]] == [f"T{m:02d}" for m in range(1, 21)]
+        assert all(s["rows"] == 9 for s in result["sheets"])
+        assert result["sheets"][-1].get("preview_omitted")
+        assert len(encode(result)) < 10000  # fits the agent's tool output limit
+    finally:
+        tools.close()
+
+
+def test_context_overflow_compacts_old_tool_results(source):
+    from zaic.model import ContextLimitError
+
+    replies = iter(
+        [
+            '{"action":"inspect_table","path":"sales.csv"}',
+            '{"action":"load_table","path":"sales.csv","name":"sales"}',
+            '{"action":"run_sql","sql":"SELECT SUM(CAST(amount AS INTEGER)) FROM sales WHERE status=\'done\'"}',
+            '{"action":"final","type":"number","answer":300}',
+        ]
+    )
+
+    class SmallContextBackend:
+        def __init__(self):
+            self.prompts = []
+
+        def generate(self, messages):
+            full = sum("Tool result:" in m["content"] for m in messages)
+            if full > 1:
+                raise ContextLimitError("too long")
+            self.prompts.append(json.dumps(messages))
+            return next(replies), {"input_tokens": 10, "output_tokens": 5}
+
+    backend = SmallContextBackend()
+    prediction, detail = ask(backend, source)
+    assert prediction["answer"] == 300 and detail["status"] == "ok"
+    assert detail["compactions"] == 2
+    assert "omitted to fit the context window" in backend.prompts[-1]
+
+
+def test_context_overflow_without_anything_to_drop_abstains(source):
+    from zaic.model import ContextLimitError
+
+    class TooLong:
+        def generate(self, messages):
+            raise ContextLimitError("too long")
+
+    prediction, detail = ask(TooLong(), source)
+    assert prediction["type"] == "abstain" and detail["status"] == "context_limit"
+
+
+def test_prompt_states_step_budget_and_shared_files(source):
+    backend = ScriptedBackend(
+        ['{"action":"list_files"}', '{"action":"final","type":"abstain"}']
+    )
+    answer_question(
+        backend,
+        source,
+        {"id": "q", "business_id": "biz_1", "question": "?", "as_of_date": "2026-01-01"},
+        max_steps=2,
+    )
+    assert "at most 2 actions" in backend.prompts[0]
+    assert "calendar.csv" in backend.prompts[0]
+    assert "your next reply must be a final answer" in backend.prompts[1]
+
+
+def test_scoring_phone_names_and_unreadable_reason():
+    gold = {"type": "string", "answer": "Diệp Mai Nam", "alias": ["KH0001"]}
+    assert correct({"type": "string", "answer": "Diệp Mai Nam 0937356589"}, gold)
+    assert correct({"type": "string", "answer": "0937356589 - Diệp Mai Nam"}, gold)
+    assert not correct({"type": "string", "answer": "Diệp Mai Nam 12"}, gold)
+    assert not correct({"type": "string", "answer": "Diệp Mai Nam Anh"}, gold)
+    answers = [{"id": "a", "type": "unanswerable", "answer": None, "alias": []}] * 1
+    answers = answers + [{"id": "b", "type": "unanswerable", "answer": None, "alias": []}]
+    report = score(
+        [{"id": "a", "type": "unanswerable"}, {"id": "b", "type": "unanswerable", "reason": 5}],
+        answers,
+    )
+    assert [d["outcome"] for d in report["details"]] == ["correct", "abstained"]
+
+
+def test_chat_template_without_system_role_falls_back():
+    from zaic.model import chat_text
+
+    class NoSystemTokenizer:
+        def apply_chat_template(self, messages, **kwargs):
+            if any(m["role"] == "system" for m in messages):
+                raise ValueError("System role not supported")
+            return "|".join(m["content"] for m in messages)
+
+    text = chat_text(
+        NoSystemTokenizer(),
+        [{"role": "system", "content": "S"}, {"role": "user", "content": "U"}],
+        thinking=False,
+    )
+    assert text == "S\n\nU"

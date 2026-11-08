@@ -2,6 +2,7 @@
 
 import argparse
 import json
+import re
 import statistics
 import unicodedata
 from collections import Counter, defaultdict
@@ -20,11 +21,28 @@ def normalize(text):
     )
 
 
+# Rulebook §9: a customer name copied together with its phone number is accepted.
+PHONE = re.compile(r"\+?\d{9,12}")
+
+
+def same_name(pred, gold):
+    if pred == gold:
+        return True
+    if gold and pred.startswith(gold) and PHONE.fullmatch(pred[len(gold) :]):
+        return True
+    return bool(gold) and pred.endswith(gold) and bool(
+        PHONE.fullmatch(pred[: -len(gold)])
+    )
+
+
 def equal_value(pred, gold, aliases=()):
     if isinstance(gold, str):
-        return isinstance(pred, str) and normalize(pred) in {
-            normalize(s) for s in [gold, *aliases] if isinstance(s, str)
-        }
+        if not isinstance(pred, str):
+            return False
+        p = normalize(pred)
+        return any(
+            same_name(p, normalize(s)) for s in [gold, *aliases] if isinstance(s, str)
+        )
     if type(gold) is bool:
         return type(pred) is bool and pred == gold
     if number(gold):
@@ -92,6 +110,11 @@ def correct(pred, gold):
     return equal_value(p, g, a if kind == "string" else ())
 
 
+def unreadable(pred):
+    """Rulebook §7: a row whose "reason" is not a string is unreadable and counts as blank."""
+    return "reason" in pred and not isinstance(pred["reason"], str)
+
+
 def score(predictions, answers, ids=None, questions=None):
     golds = {a["id"]: a for a in answers}
     preds = {p["id"]: p for p in predictions}
@@ -105,7 +128,7 @@ def score(predictions, answers, ids=None, questions=None):
     by_type, by_business = defaultdict(Counter), defaultdict(Counter)
     for ident in ids:
         gold, pred = golds[ident], preds.get(ident)
-        if pred is None or pred.get("type") == "abstain":
+        if pred is None or pred.get("type") == "abstain" or unreadable(pred):
             outcome = "abstained"
         else:
             outcome = "correct" if correct(pred, gold) else "incorrect"
@@ -188,6 +211,11 @@ def runtime(metrics, details, manifest=None):
         "steps_per_question": stats(m.get("steps") for m in metrics),
         "tool_calls_per_question": stats(m.get("tool_calls") for m in metrics),
         "input_tokens_per_question": stats(m.get("input_tokens") for m in metrics),
+        "prefilled_tokens_per_question": stats(
+            m["input_tokens"] - m.get("cached_tokens", 0)
+            for m in metrics
+            if m.get("input_tokens") is not None
+        ),
         "output_tokens_per_question": stats(m.get("output_tokens") for m in metrics),
         "peak_gpu_memory_gib": dict(peak),
     }
@@ -221,7 +249,8 @@ def print_report(report):
     print("Run status:", r["status"])
     print("Outcome by status:", r["outcome_by_status"])
     for key in ["seconds_per_question", "steps_per_question", "tool_calls_per_question",
-                "input_tokens_per_question", "output_tokens_per_question"]:
+                "input_tokens_per_question", "prefilled_tokens_per_question",
+                "output_tokens_per_question"]:
         s = r[key]
         if s:
             print(

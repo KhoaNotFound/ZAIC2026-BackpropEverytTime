@@ -1,5 +1,11 @@
-"""Lazy GPU backend: importing CLI/evaluator never downloads a model."""
+"""Lazy GPU backend for any Hugging Face causal LM with a chat template.
 
+Importing the CLI/evaluator never downloads a model. Qwen3.5 checkpoints are
+multimodal, so their text-only decoder is loaded with Qwen3_5ForCausalLM; every
+other model goes through AutoModelForCausalLM.
+"""
+
+import copy
 import time
 
 from .formats import first_json_object, strip_reasoning
@@ -76,7 +82,88 @@ def make_json_stop(tokenizer, prompt_tokens, thinking):
     return StoppingCriteriaList([JsonStop()])
 
 
-class QwenBackend:
+def model_class(config):
+    """Return (causal LM class, config to load it with) for a checkpoint config."""
+    from transformers import AutoModelForCausalLM
+
+    if getattr(config, "model_type", None) in ("qwen3_5", "qwen3_5_text"):
+        from transformers import Qwen3_5ForCausalLM
+
+        # Load only the language model of the multimodal checkpoint.
+        return Qwen3_5ForCausalLM, getattr(config, "text_config", config)
+    return AutoModelForCausalLM, config
+
+
+def chat_text(tokenizer, messages, thinking):
+    """Apply the model's chat template; fold the system prompt into the first user
+    turn for templates that reject a system role."""
+    options = {"tokenize": False, "add_generation_prompt": True, "enable_thinking": thinking}
+    try:
+        return tokenizer.apply_chat_template(messages, **options)
+    except Exception:
+        if not messages or messages[0]["role"] != "system" or len(messages) < 2:
+            raise
+        system, first, *rest = messages
+        merged = {"role": "user", "content": system["content"] + "\n\n" + first["content"]}
+        return tokenizer.apply_chat_template([merged, *rest], **options)
+
+
+class PrefixCache:
+    """Reuse the model state of prompt prefixes that were already processed.
+
+    Each agent step resends the whole conversation, and the system prompt (with
+    the rulebook) is identical for every question, so without reuse every step
+    re-prefills 10-25k tokens. Hybrid linear-attention caches (Qwen3.5) cannot be
+    cropped back to a prefix, so the state is snapshotted at message boundaries
+    ("system": end of the system message, shared by all questions; "turn": end of
+    the latest user message) and deep-copied before generation, which mutates it.
+    """
+
+    def __init__(self, model, chunk_size):
+        self.model = model
+        self.chunk_size = chunk_size
+        self.entries = {}  # key -> (token id list, cache)
+
+    def clear(self):
+        self.entries.clear()
+
+    def extend(self, cache, ids, start, stop):
+        """Feed ids[start:stop] through the model, appending to cache (None = new)."""
+        import torch
+
+        device = self.model.get_input_embeddings().weight.device
+        step = self.chunk_size or max(stop - start, 1)
+        for i in range(start, stop, step):
+            chunk = torch.tensor([ids[i : min(i + step, stop)]], device=device)
+            out = self.model(
+                input_ids=chunk, past_key_values=cache, use_cache=True, logits_to_keep=1
+            )
+            cache = out.past_key_values
+        return cache
+
+    def state_for(self, boundaries):
+        """Return the cache for the last boundary, building missing ones from the
+        longest stored prefix. boundaries: [(key, ids)] with increasing length."""
+        cache = None
+        for key, ids in boundaries:
+            base_key, base_ids, base = None, [], None
+            for k, (k_ids, k_cache) in self.entries.items():
+                n = len(k_ids)
+                if n > len(base_ids) and n <= len(ids) and ids[:n] == k_ids:
+                    base_key, base_ids, base = k, k_ids, k_cache
+            if len(base_ids) == len(ids):
+                cache = base
+            else:
+                # Extend in place only an entry this boundary supersedes.
+                if base is not None and base_key != key:
+                    base = copy.deepcopy(base)
+                self.entries.pop(key, None)
+                cache = self.extend(base, ids, len(base_ids), len(ids))
+            self.entries[key] = (ids, cache)
+        return cache
+
+
+class HFBackend:
     def __init__(
         self,
         model_id,
@@ -91,14 +178,10 @@ class QwenBackend:
         top_p=0.8,
         top_k=20,
         repetition_penalty=1.0,
+        prefix_cache=True,
     ):
         import torch
-        from transformers import (
-            AutoConfig,
-            AutoTokenizer,
-            BitsAndBytesConfig,
-            Qwen3_5ForCausalLM,
-        )
+        from transformers import AutoConfig, AutoTokenizer, BitsAndBytesConfig
 
         if not torch.cuda.is_available():
             raise RuntimeError("CUDA GPU required. Enable T4 GPUs in Kaggle settings.")
@@ -108,6 +191,7 @@ class QwenBackend:
         self.thinking = thinking
         self.model_id = model_id
         self.prefill_chunk_size = prefill_chunk_size or None
+        self.prefix_cache = prefix_cache
         if temperature > 0:
             self.sampling = {
                 "do_sample": True,
@@ -119,20 +203,25 @@ class QwenBackend:
             self.sampling = {"do_sample": False}
         self.sampling["repetition_penalty"] = repetition_penalty
         config = AutoConfig.from_pretrained(model_id)
-        text_config = getattr(config, "text_config", config)
+        cls, load_config = model_class(config)
+        layer_config = getattr(load_config, "text_config", load_config)
         if device_map == "split":
             from accelerate import init_empty_weights
 
             with init_empty_weights():
-                empty = Qwen3_5ForCausalLM(text_config)
+                empty = (
+                    cls._from_config(load_config)
+                    if hasattr(cls, "_from_config")
+                    else cls.from_config(load_config)
+                )
             names = set(dict(empty.named_modules()))
             device_map = make_split_map(
                 names,
-                text_config.num_hidden_layers,
+                layer_config.num_hidden_layers,
                 torch.cuda.device_count(),
                 bool(
                     getattr(config, "tie_word_embeddings", False)
-                    or getattr(text_config, "tie_word_embeddings", False)
+                    or getattr(layer_config, "tie_word_embeddings", False)
                 ),
             )
             del empty
@@ -162,11 +251,9 @@ class QwenBackend:
             )
         elif quantization == "8bit":
             kwargs["quantization_config"] = BitsAndBytesConfig(load_in_8bit=True)
-        # Official text-only loader maps language-model weights from the original
-        # multimodal checkpoint. Do not instantiate the unused vision tower.
-        self.model = Qwen3_5ForCausalLM.from_pretrained(
-            model_id, config=text_config, **kwargs
-        ).eval()
+        # For Qwen3.5 the text-only loader maps language-model weights from the
+        # multimodal checkpoint without instantiating the unused vision tower.
+        self.model = cls.from_pretrained(model_id, config=load_config, **kwargs).eval()
         self.device_map = {
             str(k): str(v) for k, v in getattr(self.model, "hf_device_map", {}).items()
         }
@@ -179,7 +266,26 @@ class QwenBackend:
             },
             flush=True,
         )
+        self.prefix = PrefixCache(self.model, self.prefill_chunk_size)
         self.reset_peak()
+
+    @classmethod
+    def from_loaded(cls, model, tokenizer, **options):
+        """Wrap an already-loaded model (tests, custom loaders)."""
+        import torch
+
+        backend = cls.__new__(cls)
+        backend.torch, backend.model, backend.tokenizer = torch, model, tokenizer
+        backend.model_id = getattr(model, "name_or_path", "loaded")
+        backend.context_tokens = options.get("context_tokens", 32768)
+        backend.max_new_tokens = options.get("max_new_tokens", 2048)
+        backend.thinking = options.get("thinking", False)
+        backend.prefill_chunk_size = options.get("prefill_chunk_size", 512) or None
+        backend.prefix_cache = options.get("prefix_cache", True)
+        backend.sampling = options.get("sampling", {"do_sample": False})
+        backend.device_map = {}
+        backend.prefix = PrefixCache(model, backend.prefill_chunk_size)
+        return backend
 
     def reset_peak(self):
         for i in range(self.torch.cuda.device_count()):
@@ -199,13 +305,33 @@ class QwenBackend:
             for i in range(self.torch.cuda.device_count())
         }
 
+    def boundaries(self, text, ids, messages):
+        """Token prefixes of the prompt that end at message boundaries.
+
+        A boundary is kept only if tokenizing the text up to it reproduces the
+        prompt's first tokens exactly, so reuse can never change the input.
+        """
+        found = []
+        for key, content, locate in (
+            # Chat templates often trim message content, so search the stripped text.
+            ("system", messages[0]["content"].strip(), text.find),
+            ("turn", messages[-1]["content"].strip(), text.rfind),
+        ):
+            pos = locate(content) if content else -1
+            if pos < 0:
+                continue
+            prefix = self.tokenizer(
+                text[: pos + len(content)], add_special_tokens=False
+            )["input_ids"]
+            n = len(prefix)
+            if 0 < n < len(ids) and ids[:n] == prefix and (
+                not found or n > len(found[-1][1])
+            ):
+                found.append((key, prefix))
+        return found
+
     def generate(self, messages):
-        text = self.tokenizer.apply_chat_template(
-            messages,
-            tokenize=False,
-            add_generation_prompt=True,
-            enable_thinking=self.thinking,
-        )
+        text = chat_text(self.tokenizer, messages, self.thinking)
         encoded = self.tokenizer(text, return_tensors="pt", add_special_tokens=False)
         input_tokens = encoded["input_ids"].shape[1]
         if input_tokens + self.max_new_tokens > self.context_tokens:
@@ -216,33 +342,59 @@ class QwenBackend:
         device = self.model.get_input_embeddings().weight.device
         encoded = encoded.to(device)
         started = time.perf_counter()
+        if self.prefix_cache:
+            try:
+                return self._generate(encoded, input_tokens, messages, text, started)
+            except Exception as exc:  # noqa: BLE001 -- fall back to full prefill
+                print(
+                    f"Prefix cache disabled after {type(exc).__name__}: {exc}", flush=True
+                )
+                self.prefix_cache = False
+                self.prefix.clear()
+                self.torch.cuda.empty_cache()
+                started = time.perf_counter()
+        return self._generate(encoded, input_tokens, None, text, started)
+
+    def _generate(self, encoded, input_tokens, messages, text, started):
+        options = {
+            "max_new_tokens": self.max_new_tokens,
+            **self.sampling,
+            "stopping_criteria": make_json_stop(self.tokenizer, input_tokens, self.thinking),
+            "use_cache": True,
+            # Avoid allocating [prompt_length, vocabulary_size] logits at prefill.
+            "logits_to_keep": 1,
+            "pad_token_id": (
+                self.tokenizer.pad_token_id
+                if self.tokenizer.pad_token_id is not None
+                else self.tokenizer.eos_token_id
+            ),
+        }
+        cached = 0
         with self.torch.inference_mode():
-            output = self.model.generate(
-                **encoded,
-                max_new_tokens=self.max_new_tokens,
-                **self.sampling,
-                stopping_criteria=make_json_stop(
-                    self.tokenizer, input_tokens, self.thinking
-                ),
-                use_cache=True,
-                cache_implementation="dynamic",
-                prefill_chunk_size=self.prefill_chunk_size,
-                # Avoid allocating [prompt_length, vocabulary_size] logits at prefill.
-                logits_to_keep=1,
-                pad_token_id=self.tokenizer.eos_token_id,
-            )
+            bounds = []
+            if messages is not None:
+                ids = encoded["input_ids"][0].tolist()
+                bounds = self.boundaries(text, ids, messages)
+            if bounds:
+                state = self.prefix.state_for(bounds)
+                cached = len(bounds[-1][1])
+                # Generation mutates the cache: work on a copy, prefilled up to the
+                # last prompt token so generate() only processes that token.
+                work = self.prefix.extend(copy.deepcopy(state), ids, cached, len(ids) - 1)
+                options["past_key_values"] = work
+            else:
+                options["cache_implementation"] = "dynamic"
+                options["prefill_chunk_size"] = self.prefill_chunk_size
+            output = self.model.generate(**encoded, **options)
         generated = output[0, input_tokens:]
         reply = self.tokenizer.decode(generated, skip_special_tokens=False)
-        for marker in {
-            self.tokenizer.eos_token,
-            self.tokenizer.pad_token,
-            "<|im_end|>",
-            "<|endoftext|>",
-        }:
-            if marker:
+        # Strip special tokens but keep reasoning tags, which strip_reasoning needs.
+        for marker in set(self.tokenizer.all_special_tokens) | {"<|im_end|>", "<|endoftext|>"}:
+            if marker and marker not in ("<think>", "</think>"):
                 reply = reply.replace(marker, "")
         return reply, {
             "input_tokens": input_tokens,
+            "cached_tokens": cached,
             "output_tokens": len(generated),
             "generation_seconds": time.perf_counter() - started,
         }

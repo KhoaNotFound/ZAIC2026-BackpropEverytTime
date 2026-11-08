@@ -62,7 +62,8 @@ def valid_answer(record):
             )
         )
     if kind == "unanswerable":
-        return isinstance(record.get("reason"), str) and bool(record["reason"].strip())
+        # Rulebook: "reason" is optional and unscored, but must be a string if present.
+        return "reason" not in record or isinstance(record["reason"], str)
     return kind == "abstain"
 
 
@@ -124,7 +125,7 @@ def parse_action(text):
 TOOL_PARAMS = {
     "list_files": ((), ()),
     "read_document": (("path",), ("offset", "limit")),
-    "inspect_table": (("path",), ()),
+    "inspect_table": (("path",), ("sheet",)),
     "load_table": (("path", "name"), ("sheet", "header_row")),
     "run_sql": (("sql",), ()),
     "query_sqlite": (("path", "sql"), ()),
