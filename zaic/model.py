@@ -10,6 +10,15 @@ import time
 
 from .formats import first_json_object, strip_reasoning
 
+# Used to redraw a reply that repeated the previous one: with top_p 0.8 a model copying
+# its own earlier text picks the copied token almost surely, so widen the nucleus.
+DIVERSE_SAMPLING = {
+    "do_sample": True,
+    "temperature": 1.0,
+    "top_p": 0.95,
+    "top_k": 50,
+    "repetition_penalty": 1.0,
+}
 
 class ContextLimitError(RuntimeError):
     """Prompt plus output budget exceeds --context-tokens for one question.
@@ -196,7 +205,7 @@ class HFBackend:
         quantization="4bit",
         device_map="split",
         context_tokens=16384,
-        max_new_tokens=2048,
+        max_new_tokens=1024,
         thinking=False,
         gpu_memory_gib=13,
         prefill_chunk_size=512,
@@ -303,7 +312,7 @@ class HFBackend:
         backend.torch, backend.model, backend.tokenizer = torch, model, tokenizer
         backend.model_id = getattr(model, "name_or_path", "loaded")
         backend.context_tokens = options.get("context_tokens", 32768)
-        backend.max_new_tokens = options.get("max_new_tokens", 2048)
+        backend.max_new_tokens = options.get("max_new_tokens", 1024)
         backend.thinking = options.get("thinking", False)
         backend.prefill_chunk_size = options.get("prefill_chunk_size", 512) or None
         backend.prefix_cache = options.get("prefix_cache", True)
@@ -355,7 +364,9 @@ class HFBackend:
                 found.append((key, prefix))
         return found
 
-    def generate(self, messages):
+    def generate(self, messages, diverse=False):
+        """diverse=True samples more widely; the agent uses it to redraw a reply that
+        repeated the previous one."""
         text = chat_text(self.tokenizer, messages, self.thinking)
         encoded = self.tokenizer(text, return_tensors="pt", add_special_tokens=False)
         input_tokens = encoded["input_ids"].shape[1]
@@ -369,7 +380,7 @@ class HFBackend:
         started = time.perf_counter()
         if self.prefix_cache:
             try:
-                return self._generate(encoded, input_tokens, messages, text, started)
+                return self._generate(encoded, input_tokens, messages, text, started, diverse)
             except Exception as exc:  # noqa: BLE001 -- fall back to full prefill
                 print(
                     f"Prefix cache disabled after {type(exc).__name__}: {exc}", flush=True
@@ -378,12 +389,12 @@ class HFBackend:
                 self.prefix.clear()
                 self.torch.cuda.empty_cache()
                 started = time.perf_counter()
-        return self._generate(encoded, input_tokens, None, text, started)
+        return self._generate(encoded, input_tokens, None, text, started, diverse)
 
-    def _generate(self, encoded, input_tokens, messages, text, started):
+    def _generate(self, encoded, input_tokens, messages, text, started, diverse=False):
         options = {
             "max_new_tokens": self.max_new_tokens,
-            **self.sampling,
+            **(DIVERSE_SAMPLING if diverse else self.sampling),
             "stopping_criteria": make_json_stop(self.tokenizer, input_tokens, self.thinking),
             "use_cache": True,
             # Avoid allocating [prompt_length, vocabulary_size] logits at prefill.

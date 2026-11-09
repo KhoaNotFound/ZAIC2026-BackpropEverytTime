@@ -225,6 +225,11 @@ def normalize_action(action):
         value = merged[key]
         if isinstance(value, str) and re.fullmatch(r"-?\d+", value.strip()):
             merged[key] = int(value)
+    sql = merged.get("sql")
+    if isinstance(sql, str) and "{" not in sql:
+        # Models often close the JSON braces inside the SQL string ('ok'}}"}}): SQL
+        # never ends with an unmatched brace, so drop it instead of failing the query.
+        merged["sql"] = sql.rstrip().rstrip("}").rstrip()
     missing = [k for k in required if merged.get(k) in (None, "")]
     if missing:
         raise ProtocolError(f"{name} requires {list(required)}; missing {missing}")

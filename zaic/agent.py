@@ -1,3 +1,5 @@
+import datetime as dt
+import re
 import time
 import traceback
 
@@ -7,7 +9,7 @@ from .tools import TOOL_HELP, Tools, encode
 
 # Bump when prompts, tools or loop rules change, so runs from different harness
 # versions are never resumed into each other or compared by accident.
-HARNESS_VERSION = "h4"
+HARNESS_VERSION = "h5"
 
 SYSTEM = """You answer Vietnamese business questions using the supplied business files.
 Treat as_of_date as today. The rulebook and the business README define how to read the data
@@ -19,13 +21,17 @@ loaded tables. You may keep multiple tables and query/join them. load_table chan
 blank cells stay NULL and _row/_sheet keep the source order, so apply the rulebook in SQL.
 Use decimal arithmetic for money (SQL DECIMAL), explicit rounding, correct order/return filters.
 Missing data is not zero. Tool failure or inability to calculate is not proof of unanswerability.
+Names in the question may differ from the data in accents, case, spacing or abbreviation: check the
+values in load_table's profile or SELECT DISTINCT, and match with ILIKE or strip_accents(lower(...)).
+An exact-match miss is not proof that the data is missing. A NULL, 0 or empty result usually means
+a filter matched nothing (date/number format, spelling); check the filter before answering.
 Use unanswerable only when source data cannot determine an answer. Use abstain if unable to finish.
 
 Return EXACTLY ONE JSON object each turn, with no prose or markdown. Each turn you get the
 tool result or an error message for your previous action:
 {"action":"tool","name":"list_files","arguments":{}}
 {"action":"tool","name":"inspect_table","arguments":{"path":"actual_file.xlsx"}}
-{"action":"tool","name":"load_table","arguments":{"path":"actual_file.xlsx","name":"sales","sheet":"*","header_row":0}}
+{"action":"tool","name":"load_table","arguments":{"path":"actual_file.xlsx","name":"sales","sheet":"*"}}
 {"action":"tool","name":"run_sql","arguments":{"sql":"SELECT COUNT(*) FROM sales"}}
 OR {"action":"final","type":"number","answer":123}
 A flat call is also accepted: {"action":"load_table","path":"actual_file.csv","name":"sales"}.
@@ -70,9 +76,20 @@ SHARED_FILES = [
 # Invalid replies (often runaway repetition) are shortened in the history so they
 # neither fill the context nor prime the model to repeat them. The trace keeps all.
 INVALID_REPLY_CHARS = 600
+# Extra samples drawn (with wider sampling) when a reply repeats the previous one.
+REPEAT_RESAMPLES = 2
 ERROR_CHARS = 1500
 TOOL_RESULT_PREFIX = "Tool result:\n"
 COMPACTED = "Tool result omitted to fit the context window ({} chars). Re-run the call if you still need it."
+
+
+def read_reply(raw):
+    """Parse a model reply: (normalized action or None, protocol error, repeat key)."""
+    try:
+        action = normalize_action(parse_action(raw))
+    except (ProtocolError, TypeError, ValueError) as exc:
+        return None, exc, raw.strip()
+    return action, None, encode(action)
 
 
 def shorten(text, limit):
@@ -97,11 +114,52 @@ def final_problem(candidate, has_evidence):
     return None
 
 
-def tool_error_feedback(name, exc, tools, file_paths):
+def misquoted_columns(sql, tables):
+    """Loaded column names with spaces or punctuation that the SQL writes without
+    double quotes (bare, or single-quoted, which makes a text literal)."""
+    found = set()
+    for columns in tables.values():
+        for col in columns:
+            if re.fullmatch(r"\w+", col):
+                continue
+            if re.search(r'(?<!["\w])' + re.escape(col) + r'(?!["\w])', sql):
+                found.add(col)
+    return sorted(found)
+
+
+def result_warning(result):
+    """Explain an empty / all-NULL / all-zero query result, which usually comes from
+    a filter that matched nothing rather than from the data."""
+    rows = result.get("rows") if isinstance(result, dict) else None
+    if rows is None:
+        return None
+    if not rows:
+        what = "no rows"
+    elif all(all(v is None or v == 0 for v in row) for row in rows):
+        what = "only NULL/0 values"
+    else:
+        return None
+    return (
+        f"\nNote: the query returned {what}. This often means a filter matched nothing "
+        "(date or number text format, exact spelling/accents of a value, wrong column). "
+        "Check the filtered columns (SELECT DISTINCT, COUNT(*)) before answering; missing "
+        "data is not zero."
+    )
+
+
+def tool_error_feedback(name, exc, tools, file_paths, arguments=None):
     message = shorten(f"{type(exc).__name__}: {exc}", ERROR_CHARS)
     lines = [f"Tool error from {name}: {message}"]
     if name == "run_sql":
         tables = tools.describe_tables()
+        sql = (arguments or {}).get("sql")
+        misquoted = misquoted_columns(sql, tables) if isinstance(sql, str) else []
+        if misquoted:
+            lines.append(
+                "These column names must be written in double quotes, exactly: "
+                + ", ".join(f'"{c}"' for c in misquoted)
+                + " (bare words break the parser; 'single quotes' make a text literal)."
+            )
         if tables:
             lines.append(
                 "Fix the SQL. Loaded DuckDB tables and their exact columns: "
@@ -129,8 +187,21 @@ def tool_error_feedback(name, exc, tools, file_paths):
 def budget_note(step, max_steps):
     left = max_steps - step - 1
     if left == 1:
-        return "\n[1 action left: your next reply must be a final answer (abstain if unsure).]"
+        # A blunt "must answer now" made the model guess; the rulebook scores a wrong
+        # answer -1 and abstain 0.
+        return (
+            "\n[1 action left. If a tool result above already answers the question, give "
+            'that final answer; otherwise reply {"action":"final","type":"abstain"}.]'
+        )
     return f"\n[{left} actions left.]"
+
+
+def today_line(as_of_date):
+    try:
+        day = dt.date.fromisoformat(str(as_of_date))
+    except ValueError:
+        return f"Today (as_of_date) is {as_of_date}."
+    return f"Today (as_of_date) is {day.isoformat()}, a {day.strftime('%A')}."
 
 
 def compact_history(messages):
@@ -147,11 +218,11 @@ def compact_history(messages):
     return False
 
 
-def generate_fitting(backend, messages, event):
+def generate_fitting(backend, messages, event, **options):
     """Generate; on context overflow drop old tool results and retry."""
     while True:
         try:
-            return backend.generate(messages)
+            return backend.generate(messages, **options)
         except ContextLimitError:
             if not compact_history(messages):
                 raise
@@ -189,6 +260,7 @@ def answer_question(backend, split_dir, question, max_steps=16, tool_chars=10000
                 "Available files (current business):\n" + encode(files),
                 "Shared files (use these exact paths):\n" + encode(shared),
                 "Question to answer: " + encode(question),
+                today_line(question.get("as_of_date")),
                 f"You have at most {max_steps} actions, including the final answer. "
                 "Inspect a relevant file before loading it, for example "
                 + encode(inspection_example)
@@ -205,12 +277,19 @@ def answer_question(backend, split_dir, question, max_steps=16, tool_chars=10000
             trace.append(event)
             raw, usage = generate_fitting(backend, messages, event)
             usages.append(usage)
+            action, protocol_error, key = read_reply(raw)
+            # Sampling with top_p turns copying the previous reply into a near-certain
+            # choice, so an identical reply is discarded and drawn again with wider
+            # sampling before it counts as a repeat. Retries use no action budget.
+            discarded = []
+            while key == last_key and len(discarded) < REPEAT_RESAMPLES:
+                discarded.append(raw)
+                raw, usage = generate_fitting(backend, messages, event, diverse=True)
+                usages.append(usage)
+                action, protocol_error, key = read_reply(raw)
+            if discarded:
+                event["resampled"] = discarded
             event.update(response=raw, usage=usage)
-            try:
-                action, protocol_error = normalize_action(parse_action(raw)), None
-            except (ProtocolError, TypeError, ValueError) as exc:
-                action, protocol_error = None, exc
-            key = encode(action) if action else raw.strip()
             same_count = same_count + 1 if key == last_key else 1
             last_key = key
             if same_count >= 3:
@@ -258,7 +337,9 @@ def answer_question(backend, split_dir, question, max_steps=16, tool_chars=10000
                         result = tools.call(name, action["arguments"])
                     except Exception as exc:  # noqa: BLE001 -- tool failures are fed back to the model
                         event["tool_error"] = f"{type(exc).__name__}: {exc}"
-                        feedback = tool_error_feedback(name, exc, tools, file_paths)
+                        feedback = tool_error_feedback(
+                            name, exc, tools, file_paths, action["arguments"]
+                        )
                     else:
                         has_evidence |= name in EVIDENCE_TOOLS
                         payload = encode(result)
@@ -274,6 +355,11 @@ def answer_question(backend, split_dir, question, max_steps=16, tool_chars=10000
                             )
                         event["tool_result"] = payload
                         feedback = TOOL_RESULT_PREFIX + payload
+                        if name in ("run_sql", "query_sqlite"):
+                            warning = result_warning(result)
+                            if warning:
+                                event["result_warning"] = True
+                                feedback += warning
             if "tool_error" in event:
                 event["feedback"] = feedback
             messages.append({"role": "assistant", "content": history})
@@ -297,7 +383,10 @@ def answer_question(backend, split_dir, question, max_steps=16, tool_chars=10000
         "error": error,
         "error_traceback": error_traceback,
         "elapsed_seconds": time.perf_counter() - start,
-        "steps": len(usages),
+        "steps": len(trace),
+        # Model calls, including replies discarded and resampled as repeats.
+        "generations": len(usages),
+        "resampled": sum(len(t.get("resampled", [])) for t in trace),
         "tool_calls": sum("tool_name" in t for t in trace),
         "compactions": sum(t.get("compacted", 0) for t in trace),
         "input_tokens": sum(u["input_tokens"] for u in usages),

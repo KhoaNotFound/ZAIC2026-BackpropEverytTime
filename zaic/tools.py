@@ -13,6 +13,7 @@ import re
 import sqlite3
 import threading
 import time
+from collections import Counter
 from contextlib import closing
 from decimal import Decimal
 from pathlib import Path
@@ -25,22 +26,31 @@ read_document {"path":"README.md","offset":0,"limit":12000} -> text; rulebook.md
 inspect_table {"path":"file.xlsx","sheet":"optional sheet name"} -> every sheet with its row count,
   plus the first 6 rows (numbered from 0) of each sheet while space allows; pass "sheet" to see
   one sheet. CSV -> delimiter, row count, first rows. SQLite -> table schemas and row counts.
-load_table {"path":"file.xlsx","name":"sales","sheet":"Sheet1","header_row":0} ->
-  register a sheet/CSV as DuckDB table "name". header_row is the ZERO-based row index shown by
-  inspect_table (-1 = no header). sheet: a name or index (default first sheet), a list of
-  sheet names, or "*" for all sheets, stacked into one table (columns matched by header name).
-  All cells are text exactly as inspect_table shows them; blank cells are NULL; fully blank
-  rows are skipped. Added columns: _row (source row index, same numbering as header_row) and,
-  for Excel, _sheet. Nothing is filled down, deduplicated or converted. calendar.csv is also
-  available as path. Returns columns, row counts and sample rows.
+load_table {"path":"file.xlsx","name":"sales","sheet":"*"} -> register a sheet/CSV as DuckDB
+  table "name". sheet: a name or index (default first sheet), a list of sheet names, or "*"
+  for all sheets, stacked into one table (columns matched by header name). header_row
+  (optional): ZERO-based row index of the header as numbered by inspect_table, -1 = no
+  header; when omitted it is detected per sheet (first row whose text fills most columns)
+  and reported. All cells are text exactly as inspect_table shows them; blank cells are NULL;
+  fully blank rows are skipped. Added columns: _row (source row index) and, for Excel, _sheet.
+  Nothing is filled down, deduplicated or converted. calendar.csv is also available as path.
+  Returns columns, row counts, sample rows and a "profile" of every column over ALL rows:
+  "values" {value: count} when it has few distinct values (use these exact spellings), else
+  "formats" [[pattern, count, example]] with digit runs written as 9, or "examples".
 run_sql {"sql":"SELECT ... FROM sales"} -> DuckDB query on loaded tables.
 query_sqlite {"path":"pos.sqlite","sql":"SELECT ..."} -> read-only SQLite query.
 Queries return at most 100 rows and have a time limit. Aggregate over full tables, not previews.
 DuckDB SQL can join loaded tables. SQL has no external file/network access.
-Use quoted column identifiers, normalize date/number formats based on observed data.
+Column names go in double quotes ("Ngày mua"); 'single quotes' are text literals.
 Numbers stored as text: REPLACE(text, search, replacement) takes the column FIRST, e.g.
   SUM(CAST(REPLACE("Tổng tiền", ',', '') AS DECIMAL(18,2))). TRY_CAST(x AS ...) gives NULL
-  instead of failing on bad cells; check previews for thousand separators and date formats.
+  instead of failing on bad cells. Read separators from the profile formats: '.' is a decimal
+  point in "25,000.0000" but a thousands separator in "25.000đ". A column may mix formats.
+Dates stored as text: parse before comparing, never compare 'DD/MM/YYYY' text with < or
+  BETWEEN. strptime("Ngày", '%d/%m/%Y')::DATE BETWEEN DATE '2026-01-01' AND DATE '2026-01-31';
+  TRY_STRPTIME gives NULL for rows in another format (handle each format the profile shows).
+  A 5-digit number in a date column is an Excel serial day: DATE '1899-12-30' + CAST(x AS INT).
+Text matching: strip_accents(lower("Tên hàng")) LIKE '%tom nuong%' ignores accents and case.
 Source row order is _row (within _sheet). Example: a group starts where "Mã đơn" is not NULL;
   copy the group's first value to the rows below it with
   WITH g AS (SELECT *, COUNT("Mã đơn") OVER (PARTITION BY _sheet ORDER BY _row) AS grp FROM t)
@@ -49,8 +59,75 @@ Source row order is _row (within _sheet). Example: a group starts where "Mã đ�
 
 SOURCE_SUFFIXES = {".md", ".xlsx", ".csv", ".sqlite"}
 PREVIEW_ROWS = 6
-INSPECT_PREVIEW_CHARS = 6000
+INSPECT_PREVIEW_CHARS = 5500
 RESERVED_COLUMNS = {"_row", "_sheet"}
+HEADER_SCAN_ROWS = 30
+# Cells made only of digits and separators are data (numbers, dates), not header text.
+DATA_LIKE_CELL = re.compile(r"[\d\s.,:/+\-]*")
+PROFILE_VALUES = 12  # list every value of a column with at most this many distinct values
+PROFILE_FORMATS = 6  # show formats only if this many patterns cover most values
+PROFILE_TEXT_CHARS = 60
+PROFILE_CHARS = 5000
+
+
+def detect_header(rows):
+    """Zero-based index of the likely header row, 0 if none qualifies.
+
+    Report-style exports put titles and filters above the header. The header is the
+    first row whose non-numeric text fills at least 80% of the widest row near the top.
+    """
+    sample = rows[:HEADER_SCAN_ROWS]
+    counts = [sum(v is not None for v in r) for r in sample]
+    if not counts or max(counts) == 0:
+        return 0
+    need = max(1, math.ceil(0.8 * max(counts)))
+    for i, row in enumerate(sample):
+        cells = [v for v in row if v is not None]
+        if len(cells) >= need and not any(DATA_LIKE_CELL.fullmatch(v) for v in cells):
+            return i
+    return 0
+
+
+def clip(text):
+    return text if len(text) <= PROFILE_TEXT_CHARS else text[:PROFILE_TEXT_CHARS] + "…"
+
+
+def profile_column(values, limit_values=PROFILE_VALUES, with_examples=True):
+    """Summarize a text column over all rows so the model sees every value format,
+    not only the first preview rows."""
+    present = [v for v in values if v is not None]
+    entry = {"non_null": len(present)}
+    if not present:
+        return entry
+    counts = Counter(present)
+    entry["distinct"] = len(counts)
+    if len(counts) <= limit_values:
+        entry["values"] = {clip(v): n for v, n in counts.most_common()}
+        return entry
+    shapes, example = Counter(), {}
+    for value in present:
+        shape = re.sub(r"\d+", "9", value.strip())
+        shapes[shape] += 1
+        example.setdefault(shape, value)
+    top = shapes.most_common(PROFILE_FORMATS)
+    if any(ch.isdigit() for ch in example[top[0][0]]) and sum(n for _, n in top) >= 0.95 * len(
+        present
+    ):
+        entry["formats"] = [[clip(s), n, clip(example[s])] for s, n in top]
+    elif with_examples:
+        entry["examples"] = [clip(v) for v in list(counts)[:3]]
+    return entry
+
+
+def profile_columns(data):
+    """Profile every loaded column, shrinking the summary if it gets too long."""
+    profile = {col: profile_column(values) for col, values in data.items()}
+    if len(encode(profile)) > PROFILE_CHARS:
+        profile = {
+            col: profile_column(values, limit_values=6, with_examples=False)
+            for col, values in data.items()
+        }
+    return profile
 
 
 def serial(value):
@@ -230,11 +307,13 @@ class Tools:
         delim, sheets = self.read_rows(p)
         if suffix == ".csv":
             rows = sheets[None]
+            header = detect_header(rows)
             return {
                 "delimiter": delim,
                 "rows": len(rows),
-                "preview": [trim(r) for r in rows[:PREVIEW_ROWS]],
-                "note": "preview rows are numbered from 0; use that number as header_row",
+                "detected_header_row": header,
+                "preview": [trim(r) for r in rows[: max(PREVIEW_ROWS, header + 3)]],
+                "note": "preview rows are numbered from 0, the numbering header_row uses",
             }
         names = list(sheets)
         if sheet is not None:
@@ -242,13 +321,16 @@ class Tools:
         out, used = [], 0
         for name in sheets:
             rows = sheets[name]
+            header = detect_header(rows)
             entry = {
                 "sheet": name,
                 "rows": len(rows),
                 "columns": max((len(trim(r)) for r in rows), default=0),
             }
+            if header:
+                entry["detected_header_row"] = header
             if name in names:
-                preview = [trim(r) for r in rows[:PREVIEW_ROWS]]
+                preview = [trim(r) for r in rows[: max(PREVIEW_ROWS, header + 3)]]
                 size = len(encode(preview))
                 if sheet is not None or used == 0 or used + size <= INSPECT_PREVIEW_CHARS:
                     entry["preview"] = preview
@@ -258,7 +340,8 @@ class Tools:
             out.append(entry)
         result = {
             "sheets": out,
-            "note": "preview rows are numbered from 0; use that number as header_row",
+            "note": "preview rows are numbered from 0, the numbering header_row uses; "
+            "detected_header_row is shown where the header is not row 0",
         }
         if any(e.get("preview_omitted") for e in out):
             result["note"] += (
@@ -319,14 +402,13 @@ class Tools:
             cols.append(col)
         return cols
 
-    def load_table(self, path, name, sheet=0, header_row=0):
+    def load_table(self, path, name, sheet=0, header_row=None):
         import pandas as pd
 
         if (
             not isinstance(name, str)
             or not re.fullmatch(r"[A-Za-z][A-Za-z0-9_]{0,63}", name)
-            or type(header_row) is not int
-            or header_row < -1
+            or (header_row is not None and (type(header_row) is not int or header_row < -1))
         ):
             raise ValueError(
                 "Invalid table name (letters, digits, underscore) or header_row (>= -1)"
@@ -337,24 +419,34 @@ class Tools:
         _, sheets = self.read_rows(p)
         excel = p.suffix.lower() == ".xlsx"
         names = self.sheet_names(p, sheets, sheet) if excel else [None]
-        columns, data, counts, headers = [], {}, {}, {}
-        row_ids, sheet_ids = [], []
+        columns, data, counts, headers, header_rows = [], {}, {}, {}, {}
+        row_ids, sheet_ids, warnings = [], [], []
         for sheet_name in names:
             rows = sheets[sheet_name]
-            if header_row >= len(rows):
+            detected = detect_header(rows)
+            used = detected if header_row is None else header_row
+            header_rows[sheet_name] = used
+            if used >= len(rows):
                 raise ValueError(
-                    f"header_row {header_row} beyond the {len(rows)} rows of "
+                    f"header_row {used} beyond the {len(rows)} rows of "
                     f"{sheet_name or p.name}"
                 )
-            start = header_row + 1
+            start = used + 1
             body = [(i, r) for i, r in enumerate(rows[start:], start) if any(
                 v is not None for v in r
             )]
-            header = rows[header_row] if header_row >= 0 else None
+            header = rows[used] if used >= 0 else None
             width = max(
                 [len(trim(header or []))] + [len(trim(r)) for _, r in body]
             )
             cols = self.header_names(header, width)
+            generic = sum(c.startswith("column_") for c in cols)
+            if header_row is not None and used != detected and generic >= 2:
+                warnings.append(
+                    f"header_row {used} gives {generic} unnamed columns in "
+                    f"{sheet_name or p.name}; the header looks like row {detected}: "
+                    + encode(trim(rows[detected]))
+                )
             headers[sheet_name] = cols
             counts[sheet_name] = len(body)
             offset = len(row_ids)
@@ -382,14 +474,22 @@ class Tools:
             "rows": len(frame),
             "columns": list(frame.columns),
         }
+        rows_used = set(header_rows.values())
+        result["header_row"] = (
+            rows_used.pop() if len(rows_used) == 1 else {str(k): v for k, v in header_rows.items()}
+        )
         if excel:
             result["rows_per_sheet"] = counts
         distinct = {tuple(c) for c in headers.values()}
         if len(distinct) > 1:
-            result["warning"] = (
+            warnings.append(
                 "Sheets have different headers; missing columns are NULL. Headers: "
                 + encode(headers)
             )
+        if warnings:
+            result["warning"] = " ".join(warnings)
+        # Profile before preview: if the result is ever truncated, the profile survives.
+        result["profile"] = profile_columns(data)
         result["preview"] = [
             [None if pd.isna(v) else v for v in row]
             for row in frame.head(3).itertuples(index=False)

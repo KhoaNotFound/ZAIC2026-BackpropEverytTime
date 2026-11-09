@@ -22,6 +22,41 @@ def question_seed(seed, question_id):
     return int.from_bytes(digest[:4], "big") & 0x7FFFFFFF
 
 
+def keep_complete_lines(path, keep=None):
+    """Rewrite a JSONL file without a torn final line and, if keep is given,
+    without records whose id is not in keep. Returns the kept records."""
+    if not path.exists():
+        return []
+    records = []
+    for line in path.read_text(encoding="utf-8").splitlines():
+        try:
+            record = json.loads(line)
+        except json.JSONDecodeError:
+            continue  # a line cut off when the process was killed
+        if keep is None or record.get("id") in keep:
+            records.append(record)
+    path.write_text(
+        "".join(json.dumps(r, ensure_ascii=False) + "\n" for r in records), encoding="utf-8"
+    )
+    return records
+
+
+def repair_for_resume(output, trace_path, metrics_path):
+    """Make an interrupted run resumable.
+
+    Predictions are written last per question, so they decide what is done. A
+    question killed after its trace/metrics line but before its prediction is
+    dropped from those files and rerun, instead of being recorded twice.
+    """
+    existing = keep_complete_lines(output)
+    done = {r["id"] for r in existing}
+    if len(done) != len(existing):
+        raise SystemExit(f"{output} has duplicate ids; use a new output path")
+    for path in (trace_path, metrics_path):
+        keep_complete_lines(path, done)
+    return existing
+
+
 def select_questions(questions, limit, seed, sampling):
     rng = random.Random(seed)
     if sampling == "first":
@@ -66,7 +101,12 @@ def parser():
     )
     p.add_argument("--gpu-memory-gib", type=int, default=13)
     p.add_argument("--context-tokens", type=int, default=32768)
-    p.add_argument("--max-new-tokens", type=int, default=2048)
+    p.add_argument(
+        "--max-new-tokens",
+        type=int,
+        default=1024,
+        help="Valid actions in the h4 run had p99 774 tokens; longer replies were runaway loops.",
+    )
     p.add_argument(
         "--temperature",
         type=float,
@@ -104,6 +144,13 @@ def parser():
     p.add_argument("--as-of-date", help="Required with --question: YYYY-MM-DD")
     p.add_argument("--output", type=Path, default=Path("outputs/predictions.jsonl"))
     p.add_argument("--resume", action="store_true")
+    p.add_argument(
+        "--max-hours",
+        type=float,
+        default=0,
+        help="Stop cleanly before starting a question after this many hours (0 = no limit); "
+        "continue later with --resume. Use it to stay under Kaggle's 12-hour commit limit.",
+    )
     p.add_argument(
         "--evaluate", action="store_true",
         help="After inference, compare saved predictions with this split's answers.jsonl",
@@ -188,7 +235,7 @@ def main():
     config = {
         k: str(v) if isinstance(v, Path) else v
         for k, v in vars(args).items()
-        if k not in {"resume", "dry_run", "limit", "evaluate"}
+        if k not in {"resume", "dry_run", "limit", "evaluate", "max_hours"}
     }
     from zaic.agent import HARNESS_VERSION
 
@@ -209,7 +256,7 @@ def main():
             raise SystemExit(
                 "Resume configuration/sample changed. Use a new output path."
             )
-        existing = read_jsonl(args.output)
+        existing = repair_for_resume(args.output, trace_path, metrics_path)
     elif any(p.exists() for p in [args.output, meta_path, trace_path, metrics_path]):
         raise SystemExit("Output exists. Use --resume or a new --output path.")
     done = {r["id"] for r in existing}
@@ -268,14 +315,23 @@ def main():
     }
     meta_path.write_text(json.dumps(meta, ensure_ascii=False, indent=2) + "\n")
     times, errors = [], 0
-    successful_times = []
     stopped_on_error = False
+    stopped_on_time = False
     with (
         args.output.open("a", encoding="utf-8") as out,
         trace_path.open("a", encoding="utf-8") as traces,
         metrics_path.open("a", encoding="utf-8") as metrics,
     ):
         for i, q in enumerate(pending, 1):
+            hours = (time.perf_counter() - load_start) / 3600
+            if args.max_hours and hours >= args.max_hours:
+                stopped_on_time = True
+                print(
+                    f"Time budget of {args.max_hours} h reached after {i - 1} questions; "
+                    "rerun with --resume to continue.",
+                    flush=True,
+                )
+                break
             backend.reset_peak()
             if hasattr(backend, "set_seed"):
                 backend.set_seed(question_seed(args.seed, q["id"]))
@@ -285,8 +341,6 @@ def main():
             detail["gpu_memory"] = backend.memory()
             times.append(detail["elapsed_seconds"])
             errors += detail["status"] != "ok"
-            if detail["status"] == "ok":
-                successful_times.append(detail["elapsed_seconds"])
             traces.write(json.dumps(detail, ensure_ascii=False) + "\n")
             traces.flush()
             brief = {k: v for k, v in detail.items() if k != "trace"}
@@ -313,16 +367,17 @@ def main():
     summary = {
         "completed_this_run": len(times),
         "execution_failures": errors,
-        "mean_seconds": statistics.mean(times),
-        "median_seconds": statistics.median(times),
+        "mean_seconds": statistics.mean(times) if times else None,
+        "median_seconds": statistics.median(times) if times else None,
         "stopped_on_error": stopped_on_error,
+        "stopped_on_time_budget": stopped_on_time,
         "selected_but_not_completed": len(pending) - len(times),
+        # Stalled/max_steps questions are normal outcomes and count toward the
+        # estimate; only a runtime error (which stops the run) disables it.
         "estimated_3000_questions_hours": (
-            statistics.mean(successful_times) * 3000 / 3600
-            if successful_times and not errors
-            else None
+            statistics.mean(times) * 3000 / 3600 if times and not stopped_on_error else None
         ),
-        "estimate_note": "No extrapolation when execution fails. Otherwise a rough sample estimate excluding model load time.",
+        "estimate_note": "No extrapolation after a runtime error. Otherwise a rough sample estimate excluding model load time.",
     }
     args.output.with_suffix(".summary.json").write_text(
         json.dumps(summary, ensure_ascii=False, indent=2) + "\n"

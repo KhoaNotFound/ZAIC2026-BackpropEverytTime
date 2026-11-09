@@ -191,9 +191,11 @@ class ScriptedBackend:
     def __init__(self, actions):
         self.actions = iter(actions)
         self.prompts = []
+        self.diverse = []
 
-    def generate(self, messages):
+    def generate(self, messages, diverse=False):
         self.prompts.append(json.dumps(messages))
+        self.diverse.append(diverse)
         return next(self.actions), {"input_tokens": 10, "output_tokens": 5}
 
 
@@ -562,18 +564,20 @@ def test_flat_calls_execute_tools_and_return_answer(source):
 
 
 def test_agent_stops_repeated_listing_instead_of_using_all_steps(source):
-    backend = ScriptedBackend(['{"action":"list_files","path":"nonexistent.xlsx"}'] * 3)
+    # A repeat counts only after two wider resamples also repeat: 1 + 3 + 3 replies.
+    backend = ScriptedBackend(['{"action":"list_files","path":"nonexistent.xlsx"}'] * 7)
     prediction, detail = answer_question(
         backend, source, {"id": "q", "business_id": "biz_1"}
     )
     assert prediction["type"] == "abstain"
     assert detail["status"] == "stalled"
-    assert detail["steps"] == 3
+    assert detail["steps"] == 3 and detail["generations"] == 7 and detail["resampled"] == 4
+    assert backend.diverse == [False, False, True, True, False, True, True]
     assert "three times" in detail["error"]
 
 
 def test_agent_stops_identical_protocol_errors(source):
-    backend = ScriptedBackend(["not json"] * 3)
+    backend = ScriptedBackend(["not json"] * 7)
     _, detail = answer_question(backend, source, {"id": "q", "business_id": "biz_1"})
     assert detail["status"] == "stalled"
     assert detail["steps"] == 3
@@ -749,20 +753,36 @@ def test_sql_error_feedback_lists_loaded_columns(source):
 def test_repeated_action_is_warned_not_rerun(source):
     call = '{"action":"tool","name":"query_sqlite","arguments":{"path":"pos.sqlite","sql":"select sum(amount) from sales"}}'
     backend = ScriptedBackend(
-        [call, call, '{"action":"final","type":"number","answer":300}']
+        [call, call, call, call, '{"action":"final","type":"number","answer":300}']
     )
     prediction, detail = ask(backend, source)
     assert prediction["answer"] == 300 and detail["status"] == "ok"
     assert "tool_result" not in detail["trace"][1]
     assert "repeated your previous action" in detail["trace"][1]["feedback"]
+    assert detail["trace"][1]["resampled"] == [call, call]
     assert detail["tool_calls"] == 1
+
+
+def test_repeated_reply_is_resampled_not_appended(source):
+    call = '{"action":"tool","name":"query_sqlite","arguments":{"path":"pos.sqlite","sql":"select sum(amount) from sales"}}'
+    final = '{"action":"final","type":"number","answer":300}'
+    backend = ScriptedBackend([call, call, final])
+    prediction, detail = ask(backend, source)
+    assert prediction["answer"] == 300 and detail["status"] == "ok"
+    assert detail["steps"] == 2 and detail["generations"] == 3
+    assert detail["trace"][1]["resampled"] == [call]
+    assert backend.diverse == [False, False, True]
+    # The discarded copy never enters the history: both later prompts are identical.
+    assert backend.prompts[1] == backend.prompts[2]
 
 
 def test_repeat_counter_resets_on_different_reply(source):
     listing = '{"action":"list_files"}'
-    backend = ScriptedBackend([listing, listing, "not json", listing, listing, listing])
+    # The resample after the first repeat differs ("not json"), so counting restarts.
+    backend = ScriptedBackend([listing, listing, "not json", listing] + [listing] * 6)
     _, detail = ask(backend, source)
-    assert detail["status"] == "stalled" and detail["steps"] == 6
+    assert detail["status"] == "stalled" and detail["steps"] == 5
+    assert detail["resampled"] == 5
 
 
 def test_final_needs_data_evidence_not_only_listing(source):
@@ -939,7 +959,8 @@ def test_prompt_states_step_budget_and_shared_files(source):
     )
     assert "at most 2 actions" in backend.prompts[0]
     assert "calendar.csv" in backend.prompts[0]
-    assert "your next reply must be a final answer" in backend.prompts[1]
+    assert "1 action left" in backend.prompts[1] and "abstain" in backend.prompts[1]
+    assert "Today (as_of_date) is 2026-01-01, a Thursday." in backend.prompts[0]
 
 
 def test_scoring_phone_names_and_unreadable_reason():
@@ -992,5 +1013,163 @@ def test_protocol_errors_explain_broken_json(source):
     prediction, detail = ask(backend, source)
     assert detail["status"] == "ok" and prediction["type"] == "abstain"
     assert "never closed" in detail["trace"][0]["feedback"]
-    assert detail["trace"][1]["feedback"].startswith("Your reply is identical")
+    assert detail["trace"][1]["resampled"] == [broken]
     assert "<<<" in backend.prompts[1]
+
+
+def run_cli(monkeypatch, source, output, *extra):
+    import importlib.metadata
+    import sys
+
+    import inference
+    import zaic.model
+
+    class AnswerBackend:
+        """Queries on the first step of each question, answers on the second."""
+
+        def __init__(self, *args):
+            self.device_map = {"": "cpu"}
+
+        def reset_peak(self):
+            pass
+
+        def memory(self):
+            return {}
+
+        def generate(self, messages):
+            if len(messages) == 2:
+                reply = '{"action":"query_sqlite","path":"pos.sqlite","sql":"select sum(amount) from sales"}'
+            else:
+                reply = '{"action":"final","type":"number","answer":300}'
+            return reply, {"input_tokens": 10, "output_tokens": 5}
+
+    monkeypatch.setattr(zaic.model, "HFBackend", AnswerBackend)
+    monkeypatch.setattr(importlib.metadata, "version", lambda package: "test")
+    argv = ["inference.py", "--data-dir", str(source), "--limit", "3", "--output", str(output), *extra]
+    monkeypatch.setattr(sys, "argv", argv)
+    inference.main()
+
+
+def three_questions(source):
+    questions = [
+        {"id": f"q{i}", "business_id": "biz_1", "question": "Tổng tiền?", "as_of_date": "2026-01-01"}
+        for i in range(3)
+    ]
+    (source / "questions.jsonl").write_text("".join(json.dumps(q) + "\n" for q in questions))
+    (source / "answers.jsonl").write_text(
+        "".join(json.dumps({"id": q["id"], "type": "number", "answer": 300}) + "\n" for q in questions)
+    )
+
+
+def test_resume_after_kill_drops_torn_lines_and_unfinished_traces(source, tmp_path, monkeypatch):
+    three_questions(source)
+    output = tmp_path / "run" / "predictions.jsonl"
+    run_cli(monkeypatch, source, output)
+    # Simulate a kill: last prediction lost after its trace/metrics were written,
+    # plus a torn line at the end of each file.
+    lines = output.read_text().splitlines()
+    output.write_text(lines[0] + "\n" + '{"id": "q')
+    for suffix in (".metrics.jsonl", ".traces.jsonl"):
+        path = output.with_suffix(suffix)
+        path.write_text(path.read_text() + '{"id": "q2", "sta')
+    run_cli(monkeypatch, source, output, "--resume", "--evaluate")
+    assert [r["id"] for r in read_jsonl(output)] == [
+        json.loads(lines[0])["id"],
+        *[r["id"] for r in read_jsonl(output)][1:],
+    ]
+    ids = [r["id"] for r in read_jsonl(output)]
+    assert sorted(ids) == ["q0", "q1", "q2"]
+    for suffix in (".metrics.jsonl", ".traces.jsonl"):
+        assert sorted(r["id"] for r in read_jsonl(output.with_suffix(suffix))) == ["q0", "q1", "q2"]
+    report = json.loads(output.with_suffix(".evaluation.json").read_text())
+    assert report["overall"]["correct"] == 3
+
+
+def test_time_budget_stops_cleanly_then_resume_finishes(source, tmp_path, monkeypatch):
+    three_questions(source)
+    output = tmp_path / "budget" / "predictions.jsonl"
+    run_cli(monkeypatch, source, output, "--max-hours", "1e-12")  # no SystemExit
+    summary = json.loads(output.with_suffix(".summary.json").read_text())
+    assert summary["stopped_on_time_budget"] is True
+    assert summary["completed_this_run"] == 0 and summary["mean_seconds"] is None
+    # A different time budget does not block resuming the same run.
+    run_cli(monkeypatch, source, output, "--resume", "--max-hours", "11")
+    assert sorted(r["id"] for r in read_jsonl(output)) == ["q0", "q1", "q2"]
+    summary = json.loads(output.with_suffix(".summary.json").read_text())
+    assert summary["stopped_on_time_budget"] is False
+    assert summary["estimated_3000_questions_hours"] is not None
+
+
+def test_load_table_detects_report_header_and_profiles_columns(source):
+    import openpyxl
+
+    wb = openpyxl.Workbook()
+    ws = wb.active
+    ws.title = "T01"
+    ws.append(["SỔ CHI TIẾT BÁN HÀNG"])
+    ws.append(["Kỳ báo cáo: toàn bộ", "Kênh bán: Tất cả"])
+    ws.append([])
+    ws.append(["Ngày", "Trạng thái", "Thành tiền"])
+    ws.append(["01/02/2025", "Đã hoàn thành", "19,000.0000"])
+    ws.append(["45689", "Đã hủy", "1,734,000.0000"])
+    ws.append(["1 thg 2 2025", "Đã hoàn thành", "19,000.0000"])
+    wb.save(source / "data/biz_1/report.xlsx")
+    tools = Tools(source, "biz_1")
+    try:
+        assert tools.inspect_table("report.xlsx")["sheets"][0]["detected_header_row"] == 3
+        result = tools.load_table("report.xlsx", "t")
+        assert result["header_row"] == 3 and "warning" not in result
+        assert result["columns"][:3] == ["Ngày", "Trạng thái", "Thành tiền"]
+        profile = result["profile"]
+        assert profile["Trạng thái"]["values"] == {"Đã hoàn thành": 2, "Đã hủy": 1}
+        assert profile["Ngày"]["values"]["45689"] == 1  # few distinct: every value listed
+        # An explicit wrong header_row is honored but explained.
+        wrong = tools.load_table("report.xlsx", "w", header_row=0)
+        assert "looks like row 3" in wrong["warning"]
+        assert tools.load_table("sales.csv", "s")["header_row"] == 0
+    finally:
+        tools.close()
+
+
+def test_profile_shows_value_formats_for_many_distinct_values():
+    from zaic.tools import profile_column
+
+    values = [f"{i}.000đ" for i in range(20, 60)] + [f"{i}k" for i in range(20, 30)] + [None]
+    entry = profile_column(values)
+    assert entry["non_null"] == 50 and entry["distinct"] == 50
+    assert entry["formats"] == [["9.9đ", 40, "20.000đ"], ["9k", 10, "20k"]]
+    names = profile_column([f"Khách {chr(65 + i)}{chr(65 + j)}" for i in range(26) for j in range(3)])
+    assert "formats" not in names and len(names["examples"]) == 3
+
+
+def test_sql_closing_braces_inside_string_are_dropped():
+    from zaic.formats import normalize_action
+
+    action = normalize_action(
+        {"action": "run_sql", "arguments": {"sql": "SELECT 1 FROM t WHERE x = 'ok'}} "}}
+    )
+    assert action["arguments"]["sql"] == "SELECT 1 FROM t WHERE x = 'ok'"
+    struct = normalize_action({"action": "run_sql", "sql": "SELECT {'a': 1}"})
+    assert struct["arguments"]["sql"] == "SELECT {'a': 1}"
+
+
+def test_sql_errors_name_misquoted_columns(source):
+    (source / "data/biz_1/orders.csv").write_text("Ngày mua,Tên khách,amount\n2026-01-01,An,5\n")
+    load = '{"action":"load_table","path":"orders.csv","name":"o"}'
+    bad = '{"action":"run_sql","sql":"SELECT SUM(amount) FROM o WHERE Ngày mua = \'2026-01-01\' GROUP BY \'Tên khách\'"}'
+    backend = ScriptedBackend([load, bad, '{"action":"final","type":"abstain"}'])
+    _, detail = ask(backend, source)
+    feedback = detail["trace"][1]["feedback"]
+    assert 'double quotes, exactly: "Ngày mua", "Tên khách"' in feedback
+
+
+def test_empty_or_zero_sql_result_gets_a_warning(source):
+    load = '{"action":"load_table","path":"sales.csv","name":"s"}'
+    zero = '{"action":"run_sql","sql":"SELECT COUNT(*) FROM s WHERE status = \'Done\'"}'
+    nonzero = '{"action":"run_sql","sql":"SELECT COUNT(*) FROM s WHERE status = \'done\'"}'
+    backend = ScriptedBackend([load, zero, nonzero, '{"action":"final","type":"number","answer":2}'])
+    prediction, detail = ask(backend, source)
+    assert prediction["answer"] == 2
+    assert detail["trace"][1]["result_warning"] is True
+    assert "only NULL/0" in backend.prompts[2]
+    assert "result_warning" not in detail["trace"][2]
