@@ -73,8 +73,14 @@ class Metrics:
             raise Unsupported("shop has no order ids")
 
     # ------------------------------------------------------------ filters
+    def need_times(self, rows):
+        if not any(r.get("time") for r in rows):
+            raise Unsupported("no order times for shifts")
+
     def order_rows(self, period, statuses=COUNTED, shift=None, **filters):
         self.need_orders()
+        if shift:
+            self.need_times(self.orders)
         out = []
         for o in self.orders:
             day = o.get("day")
@@ -89,9 +95,18 @@ class Metrics:
             out.append(o)
         return out
 
-    def line_rows(self, period, statuses=COUNTED, item=None, group=None, kinds=("item", "service"), shift=None, **filters):
+    def line_rows(self, period, statuses=COUNTED, item=None, group=None, kinds=("item", "service"), shift=None, size=None, unit=None, **filters):
         if getattr(self.shop, "combined_items", False):
             raise Unsupported("items share cells with toppings")
+        if size is not None:
+            # §6 cà phê: size M / L = item names ending in "(M)" / "(L)".
+            suffix = f"({fold(size)})"
+            if not any(fold(r.get("item_name") or "").endswith(suffix) for r in self.lines):
+                raise NoData(f"no item has size {size}")
+        if unit is not None:
+            unit = fold(unit)
+        if shift:
+            self.need_times(self.lines)
         out = []
         for r in self.lines:
             day = r.get("day")
@@ -101,9 +116,13 @@ class Metrics:
                 continue
             if kinds and r.get("kind") not in kinds:
                 continue
-            if item is not None and not item_matches(r, item):
+            if item is not None and not self.is_item(r, item):
                 continue
             if group is not None and fold(r.get("group") or "") != fold(group):
+                continue
+            if size is not None and not fold(r.get("item_name") or "").endswith(suffix):
+                continue
+            if unit is not None and fold(r.get("base_unit") or "") != unit:
                 continue
             if shift and not in_shift(r.get("time"), shift):
                 continue
@@ -112,9 +131,23 @@ class Metrics:
             out.append(r)
         return out
 
+    def is_item(self, row, item):
+        """§8: names that point to the same code are the same item."""
+        name, codes = self.item_keys(item)
+        return fold(row.get("item_name") or "") == name or (row.get("item_code") is not None and fold(row["item_code"]) in codes)
+
+    def item_keys(self, item):
+        cache = self.__dict__.setdefault("_item_keys", {})
+        if item not in cache:
+            name = fold(item)
+            codes = {fold(r["item_code"]) for r in self.lines if r.get("item_code") and fold(r.get("item_name") or "") == name}
+            codes |= {fold(r["item_code"]) for r in self.lines if r.get("item_code") and fold(r["item_code"]) == name}
+            cache[item] = (name, codes)
+        return cache[item]
+
     # ------------------------------------------------------------ metrics
     def revenue_value(self, period, item=None, group=None, shift=None, **filters):
-        if item is not None or group is not None or "rx" in filters or "ingredient" in filters:
+        if item is not None or group is not None or any(k in filters for k in ("rx", "ingredient", "size", "unit")):
             rows = self.line_rows(period, item=item, group=group, shift=shift, **filters)
             if not rows and not self.lines:
                 raise Unsupported("no line items")
@@ -197,7 +230,9 @@ class Metrics:
         day = min(d for d, v in totals.items() if v == best)
         return {"type": "date", "answer": day.isoformat()}
 
-    def qty_value(self, period, item=None, unit=None, **kw):
+    def qty_value(self, period, item=None, **kw):
+        """§3: quantity in base units; `unit` keeps only items whose base unit
+        is that unit, `size` only items of that size."""
         rows = self.line_rows(period, statuses=COUNTED, item=item, kinds=("item",), **kw)
         total = Decimal(0)
         for r in rows:
@@ -211,7 +246,7 @@ class Metrics:
         codes = {}
         rows = self.line_rows(period, statuses=COUNTED, kinds=("item",), **kw)
         for r in rows:
-            name = r.get("item_name") or r.get("item_code")
+            name = self.item_label(r)
             if name is None:
                 continue
             if measure == "qty":
@@ -228,6 +263,20 @@ class Metrics:
             raise Unsupported("no items in period")
         # §9: ties by code ascending (name when there is no code).
         return sorted(totals, key=lambda n: (-totals[n], str(codes[n]))), totals
+
+    def item_label(self, row):
+        """One name per item: lines of the same code share the first name seen
+        for that code (§8), so spelling variants are not ranked separately."""
+        labels = self.__dict__.get("_labels")
+        if labels is None:
+            labels = self.__dict__.setdefault("_labels", {})
+            for r in self.lines:
+                if r.get("item_code") and r.get("item_name"):
+                    labels.setdefault(fold(r["item_code"]), r["item_name"])
+        code = row.get("item_code")
+        if code:
+            return labels.get(fold(code)) or row.get("item_name") or code
+        return row.get("item_name")
 
     def share(self, period, part, **kw):
         """§1: revenue of a part (group, item, channel, customer group, payment
@@ -294,24 +343,13 @@ class Metrics:
         self.need_orders()
         orders = defaultdict(set)
         for r in self.line_rows(period, kinds=("item",), **kw):
-            name = r.get("item_name") or r.get("item_code")
+            name = self.item_label(r)
             if name and r.get("order_id"):
                 orders[name].add(r["order_id"])
         return {"type": "number", "answer": sum(1 for v in orders.values() if compare(len(v), op, value))}
 
     def customer_key(self, row):
-        """§3: customer code when the shop has codes, else the name ignoring
-        spelling (case/accents/spaces); walk-in customers are not customers."""
-        cid = row.get("customer_id")
-        if cid:
-            return ("id", fold(cid))
-        name = row.get("customer_name")
-        if not name:
-            return None
-        key = fold(name)
-        if re.fullmatch(r"(khach )?(le|vang lai)|kl|khach|walk ?in|guest", key):
-            return None
-        return ("name", re.sub(r"[^a-z0-9]", "", key))
+        return customer_key(row)
 
     def has_customers(self):
         return any(o.get("customer_id") or o.get("customer_name") for o in self.orders)
@@ -361,6 +399,285 @@ class Metrics:
         names, _ = self.customer_ranking(period, measure, **kw)
         return {"type": "string", "answer": names[0]}
 
+    def best_staff(self, period, **kw):
+        """§3: the staff member with the highest revenue in the period."""
+        if not self.orders or not any(o.get("staff") for o in self.orders):
+            raise NoData("shop does not record staff")
+        totals = defaultdict(Decimal)
+        for o in self.order_rows(period, **kw):
+            if o.get("staff"):
+                totals[o["staff"]] += o.get("revenue") or 0
+        if not totals:
+            raise Unsupported("no staff sales in period")
+        return {"type": "string", "answer": min(totals, key=lambda s: (-totals[s], str(s)))}
+
+    # ------------------------------------------------------- stock, profit
+    def stock_table(self, period):
+        """§5 closing stock per item key (code, else name) in base units at the
+        end of `period.end`. Only the stock report is trusted, and it states
+        the stock of the last day of data; rebuilding stock from purchases,
+        sales and returns is left to another path."""
+        shop = self.shop
+        if not shop.stock and not shop.purchases:
+            raise NoData("shop does not record stock or purchases")
+        if not shop.stock or self.last_day is None or period.end != self.last_day:
+            raise Unsupported("no stock report for that day")
+        return dict(shop.stock)
+
+    def stock_of(self, period, item):
+        table = self.stock_table(period)
+        name, codes = self.item_keys(item)
+        hits = [table[k] for k in codes | {name} if k in table]
+        if not hits:
+            raise Unsupported("item has no stock row")
+        return hits[0]
+
+    def stock_qty(self, period, item, big_unit=None):
+        """Stock of an item in base units, or [whole big units, loose base units] (§5)."""
+        qty = self.stock_of(period, item)
+        if big_unit is None:
+            return {"type": "number", "answer": number(qty)}
+        name, codes = self.item_keys(item)
+        factor = None
+        for k in codes | {name}:
+            hit = self.shop.conversions.get((k, fold(big_unit)))
+            if hit:
+                factor = hit[0]
+        if not factor or factor <= 1:
+            raise Unsupported("no conversion for that unit")
+        whole = int(qty // factor)
+        return {"type": "list", "answer": [whole, number(qty - whole * factor)]}
+
+    def stock_value(self, period):
+        """§5: stock of each item times the catalog cost of one base unit, items in stock only."""
+        table = self.stock_table(period)
+        products = self.shop.products or {}
+        total, seen = Decimal(0), set()
+        for k, qty in table.items():
+            prod = products.get(k)
+            ident = prod and fold(prod.get("item_code") or prod.get("item_name") or "")
+            if qty <= 0 or prod is None or ident in seen:
+                continue
+            if prod.get("unit_cost") is None:
+                raise Unsupported("catalog has no cost for an item in stock")
+            seen.add(ident)
+            total += qty * prod["unit_cost"]
+        if not seen:
+            raise Unsupported("no catalog cost")
+        return {"type": "number", "answer": money(total)}
+
+    def unsold_count(self, period):
+        """§5: items sold before the period (in counted orders) with no counted sale in it."""
+        if period.start is None:
+            raise Unsupported("unsold items need a period")
+        before, during = set(), set()
+        for r in self.line_rows(Period_all(period.end), kinds=("item",)):
+            label = self.item_label(r)
+            if label is None:
+                continue
+            (during if r["day"] >= period.start else before).add(fold(label))
+        return {"type": "number", "answer": len(before - during)}
+
+    def gross_profit_value(self, period, **kw):
+        """§5: revenue minus quantity x the cost written on each sale line."""
+        rows = self.line_rows(period, **kw)
+        if not any(r.get("unit_cost") is not None for r in self.lines[:5000]):
+            raise NoData("sale lines carry no cost")
+        total = Decimal(0)
+        for r in rows:
+            total += r.get("line_amount") or 0
+            if r.get("kind") == "item":
+                if r.get("unit_cost") is None or r.get("qty") is None:
+                    raise Unsupported("sale line without cost")
+                total -= r["qty"] * r["unit_cost"]
+        return total
+
+    def gross_profit(self, period, **kw):
+        return {"type": "number", "answer": money(self.gross_profit_value(period, **kw))}
+
+    def most_profitable_item(self, period, **kw):
+        if not any(r.get("unit_cost") is not None for r in self.lines[:5000]):
+            raise NoData("sale lines carry no cost")
+        names, _ = self.item_ranking(period, "profit", **kw)
+        return {"type": "string", "answer": names[0]}
+
+    # --------------------------------------------------------------- debt
+    def debt_book(self):
+        """§4: per order, what the customer owes and when it was paid.
+        Cancelled orders, COD orders and marketplace orders are never debts."""
+        book = self.__dict__.get("_debt_book")
+        if book is not None:
+            return book
+        if not self.shop.payments:
+            headers = [fold(h) for spec in self.shop.readme.files.values() for h in spec.columns]
+            known = any(o.get("paid") is not None or o.get("debt") is not None for o in self.orders)
+            if known or any(re.search(r"\bno\b|chua tra|da tra|da thu|con thieu", h) for h in headers):
+                raise Unsupported("debts are not kept as a payment list")
+            raise NoData("shop does not record payments or debts")
+        self.need_orders()
+        paid = defaultdict(list)
+        for p in self.shop.payments:
+            if p.get("day") is not None:
+                paid[p["order_id"]].append((p["day"], p["amount"]))
+        book = []
+        for o in self.orders:
+            if o["status"] == "cancelled" or o.get("day") is None:
+                continue
+            kind = payment_kind(o.get("payment_method"))
+            if kind == "cod" or MARKETPLACE.search(fold(o.get("channel") or "")):
+                continue
+            total = o.get("order_total")
+            if total is None:
+                raise Unsupported("order without a total to pay")
+            book.append({"order": o, "total": total, "payments": sorted(paid.get(o["order_id"], [])), "on_credit": kind == "debt"})
+        self.__dict__["_debt_book"] = book
+        return book
+
+    def open_debts(self, asof):
+        """(order, amount still owed at the end of day `asof`) for orders owing > 0."""
+        out = []
+        for e in self.debt_book():
+            day = e["order"]["day"]
+            if day > asof:
+                continue
+            left = e["total"] - sum((a for d, a in e["payments"] if d <= asof), Decimal(0))
+            if left > 0:
+                out.append((e["order"], left))
+        return out
+
+    def debt_total(self, period):
+        return {"type": "number", "answer": money(sum((left for _, left in self.open_debts(period.end)), Decimal(0)))}
+
+    def debt_by_customer(self, asof):
+        totals, names, codes = defaultdict(Decimal), {}, {}
+        for o, left in self.open_debts(asof):
+            k = self.customer_key(o)
+            if not k:
+                continue
+            totals[k] += left
+            names.setdefault(k, o.get("customer_name") or o.get("customer_id"))
+            codes.setdefault(k, o.get("customer_id") or o.get("customer_name"))
+        return totals, names, codes
+
+    def debt_customers(self, period):
+        totals, _, _ = self.debt_by_customer(period.end)
+        return {"type": "number", "answer": len(totals)}
+
+    def debt_top(self, period, k):
+        totals, names, codes = self.debt_by_customer(period.end)
+        ranked = sorted(totals, key=lambda c: (-totals[c], str(codes[c])))[:k]
+        return {
+            "type": "table",
+            "answer": {"columns": ["khach_hang", "so_tien_no"], "rows": [[names[c], money(totals[c])] for c in ranked]},
+        }
+
+    def debt_aging(self, period, buckets):
+        """§4: debt age counts days from the order date. `buckets` are
+        (low, high) inclusive day ranges, None for an open end."""
+        asof, sums = period.end, [Decimal(0)] * len(buckets)
+        for o, left in self.open_debts(asof):
+            age = (asof - o["day"]).days
+            for i, (lo, hi) in enumerate(buckets):
+                if (lo is None or age >= lo) and (hi is None or age <= hi):
+                    sums[i] += left
+        values = [money(v) for v in sums]
+        return {"type": "number", "answer": values[0]} if len(values) == 1 else {"type": "list", "answer": values}
+
+    def customer_keys(self, name):
+        """Customer keys whose name is `name` (a phone number beside the name is ignored)."""
+        target = person_name(name)
+        return {
+            self.customer_key(o)
+            for o in self.orders
+            if o.get("customer_name") and person_name(o["customer_name"]) == target and self.customer_key(o)
+        }
+
+    def debt_flows(self, period, customer=None):
+        """§4: (new debt, debt repaid) in the period, over orders sold on
+        credit. New debt is what an order placed in the period left unpaid on
+        its own day; repayments are payments dated after the order day."""
+        keys = None
+        if customer is not None:
+            keys = self.customer_keys(customer)
+            if len(keys) != 1:
+                raise Unsupported("customer name is not unique")
+        added = repaid = Decimal(0)
+        for e in self.debt_book():
+            o = e["order"]
+            if not e["on_credit"] or (keys is not None and self.customer_key(o) not in keys):
+                continue
+            if period.contains(o["day"]):
+                unpaid = e["total"] - sum((a for d, a in e["payments"] if d <= o["day"]), Decimal(0))
+                added += max(unpaid, Decimal(0))
+            repaid += sum((a for d, a in e["payments"] if d > o["day"] and period.contains(d)), Decimal(0))
+        return added, repaid
+
+    def debt_collected(self, period):
+        return {"type": "number", "answer": money(self.debt_flows(period)[1])}
+
+    def debt_change(self, period, customer):
+        added, repaid = self.debt_flows(period, customer)
+        return {"type": "list", "answer": [money(added), money(repaid)]}
+
+    # ---------------------------------------------------------- purchases
+    def purchase_rows(self, period, item=None):
+        """§5: purchase lines of slips dated in the period, cancelled slips left out."""
+        if not self.shop.purchases:
+            raise NoData("shop does not record purchases")
+        name, codes = self.item_keys(item) if item is not None else (None, set())
+        out = []
+        for r in self.shop.purchases:
+            if r["cancelled"] or r.get("day") is None or not period.contains(r["day"]):
+                continue
+            if item is not None and not (
+                fold(r.get("item_name") or "") == name or (r.get("item_code") and fold(r["item_code"]) in codes)
+            ):
+                continue
+            out.append(r)
+        return out
+
+    def purchase_slips(self, period):
+        if not self.shop.purchase_slips:
+            raise NoData("shop does not record purchases")
+        return [
+            s
+            for s in self.shop.purchase_slips.values()
+            if not s["cancelled"] and s.get("day") is not None and period.contains(s["day"])
+        ]
+
+    def purchase_total(self, period):
+        total = sum((s["purchase_total"] for s in self.purchase_slips(period) if s.get("purchase_total") is not None), Decimal(0))
+        return {"type": "number", "answer": money(total)}
+
+    def purchase_avg_price(self, period, item):
+        """§5: average purchase price weighted by purchased quantity, per purchase unit."""
+        rows = [r for r in self.purchase_rows(period, item) if r.get("qty") and r.get("price") is not None]
+        if not any(r.get("price") is not None for r in self.shop.purchases):
+            raise NoData("shop does not record purchase prices")
+        if not rows:
+            raise Unsupported("item not purchased in period")
+        if len({fold(r.get("unit") or "") for r in rows}) > 1:
+            raise Unsupported("item purchased in several units")
+        qty = sum((r["qty"] for r in rows), Decimal(0))
+        return {"type": "number", "answer": money(sum((r["qty"] * r["price"] for r in rows), Decimal(0)) / qty)}
+
+    def top_supplier(self, period):
+        totals = defaultdict(Decimal)
+        for s in self.purchase_slips(period):
+            if s.get("supplier") and s.get("purchase_total") is not None:
+                totals[s["supplier"]] += s["purchase_total"]
+        if not totals:
+            raise Unsupported("no supplier purchases in period")
+        return {"type": "string", "answer": min(totals, key=lambda s: (-totals[s], str(s)))}
+
+    def purchase_minus_sales(self, period, item):
+        """§5: purchased minus sold quantity of an item, both in base units."""
+        rows = self.purchase_rows(period, item)
+        if any(r.get("base_qty") is None for r in rows):
+            raise Unsupported("purchase line without quantity")
+        bought = sum((r["base_qty"] for r in rows), Decimal(0))
+        return {"type": "number", "answer": number(bought - self.qty_value(period, item=item))}
+
     def top_items(self, period, k, measure="qty", **kw):
         names, _ = self.item_ranking(period, measure, **kw)
         return {"type": "list", "answer": names[:k]}
@@ -368,6 +685,43 @@ class Metrics:
     def best_item(self, period, measure="qty", **kw):
         names, _ = self.item_ranking(period, measure, **kw)
         return {"type": "string", "answer": names[0]}
+
+
+class Period_all:
+    """Everything up to and including `end` (duck-typed Period)."""
+
+    start = None
+
+    def __init__(self, end):
+        self.end = end
+
+    def contains(self, day):
+        return day <= self.end
+
+
+def customer_key(row):
+    """§3: customer code when the shop has codes, else the name ignoring
+    spelling (case/accents/spaces); walk-in customers are not customers."""
+    cid = row.get("customer_id")
+    if cid:
+        return ("id", fold(cid))
+    name = row.get("customer_name")
+    if not name:
+        return None
+    key = fold(name)
+    if re.fullmatch(r"(khach )?(le|vang lai)|kl|khach|walk ?in|guest", key):
+        return None
+    return ("name", re.sub(r"[^a-z0-9]", "", key))
+
+
+def person_name(name):
+    """Folded customer name without a phone number written beside it (§9)."""
+    text = fold(name)
+    text = re.sub(r"\s*[-–(]?\s*\+?\d[\d .]{7,}\)?\s*$", "", text)
+    return re.sub(r"^\+?\d[\d .]{7,}\s*[-–]?\s*", "", text).strip(" -–")
+
+
+MARKETPLACE = re.compile(r"shopee|lazada|tiki|tiktok|sendo|tmdt|\bsan\b|marketplace|ecommerce")
 
 
 def in_shift(time, shift):

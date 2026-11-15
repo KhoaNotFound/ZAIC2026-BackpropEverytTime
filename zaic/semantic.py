@@ -141,6 +141,10 @@ class Shop:
         self.products = None
         self.customers = None
         self.payments = None
+        self.purchases = None  # one record per purchase line (§5)
+        self.purchase_slips = None  # purchase id -> slip record
+        self.batches = None  # lots: item, batch id, expiry, purchase price
+        self.stock = None  # closing stock at the data end: item key -> base quantity
         self.conversions = {}
         self.data_end = self.readme.data_end
         # Toppings written in the same cell as the drink ("Trà sữa + 2 Trân châu")
@@ -337,6 +341,9 @@ class Shop:
         self.products = self._build_products(kinds.get("products", []))
         self.customers = self._build_customers(kinds.get("customers", []))
         self.drugs = self._build_drugs(kinds.get("drugs", []))
+        self._build_purchases(kinds.get("purchases", []) + kinds.get("batches", []))
+        self._build_payments(kinds.get("payments", []))
+        self._build_stock(kinds.get("stock", []))
         orders_specs = kinds.get("orders", [])
         lines_specs = kinds.get("lines", [])
         if not lines_specs and not orders_specs:
@@ -357,6 +364,14 @@ class Shop:
         for header, role in roles.items():
             if role and role not in by_role:
                 by_role[role] = header
+            elif role == "group":
+                # Two classification columns: the one that actually separates
+                # items wins over a constant like "Hàng hóa".
+                def variety(h):
+                    return len({r.get(h) for r in records[:5000] if r.get(h) is not None})
+
+                if variety(header) > variety(by_role[role]):
+                    by_role[role] = header
         seq_orders = "order_seq" in by_role and "order_id" not in by_role
         if seq_orders:
             by_role["order_id"] = by_role.pop("order_seq")
@@ -412,6 +427,11 @@ class Shop:
                         rec["unit"] = unit
                     if unit:
                         rec["_qty_unit"] = unit
+                elif role == "purchase_qty":
+                    number, unit = parse_qty(v)
+                    rec["purchase_qty"] = number
+                    if unit and not rec.get("unit_purchase"):
+                        rec["unit_purchase"] = unit
         return out
 
     def _build_conversions(self, specs):
@@ -458,6 +478,135 @@ class Shop:
                 for k in filter(None, (key(r.get("item_code")), key(r.get("item_name") or r.get("name")))):
                     drugs[k] = entry
         return drugs
+
+    def _build_purchases(self, specs):
+        """Purchase slips and their lines (§5). A shop may keep one file with a
+        row per purchased item, or a slip file plus a detail file; lot files
+        (batch id without a purchase quantity) are kept apart as `batches`."""
+        if not specs:
+            return
+        heads, lines, batches = {}, [], []
+        slip_level = ("purchase_id", "purchase_date", "purchase_status", "supplier", "purchase_total", "note")
+        # A lot list (batch id, no purchase quantity in purchase units) only
+        # repeats the purchase lines when the shop also has a line file.
+        has_line_file = any("purchase_qty" in spec.roles.values() for spec in specs)
+        for spec in specs:
+            roles = set(spec.roles.values())
+            rows = self.typed(self.read_spec(spec), spec)
+            has_item = bool(roles & {"item_code", "item_name"})
+            lot_list = has_item and "batch_id" in roles and "purchase_qty" not in roles
+            if lot_list:
+                batches += rows
+            if lot_list and has_line_file:
+                continue
+            if has_item and roles & {"purchase_qty", "purchase_base_qty", "purchase_line_amount"}:
+                current, prev = {}, None
+                for r in rows:  # grouped rows: slip cells only on the first line
+                    if (r["_file"], r["_sheet"]) != prev:
+                        current, prev = {}, (r["_file"], r["_sheet"])
+                    if r.get("purchase_id") is not None:
+                        current = {k: r.get(k) for k in slip_level if r.get(k) is not None}
+                    elif "purchase_id" in roles:
+                        for k, v in current.items():
+                            if r.get(k) is None:
+                                r[k] = v
+                lines += rows
+            elif "purchase_id" in roles:
+                for r in rows:
+                    if r.get("purchase_id") is not None:
+                        head = heads.setdefault(r["purchase_id"], {})
+                        for k in slip_level:
+                            if r.get(k) is not None and head.get(k) is None:
+                                head[k] = r[k]
+        slips = {}
+        for pid, head in heads.items():
+            slips[pid] = dict(head, lines=[])
+        for i, r in enumerate(lines):
+            pid = r.get("purchase_id")
+            if pid is None:
+                pid = f"{r['_file']}#{r['_sheet']}#{r['_row']}"  # a book without slip numbers
+            slip = slips.setdefault(pid, {"purchase_id": pid, "lines": []})
+            for k in slip_level:
+                if slip.get(k) is None and r.get(k) is not None:
+                    slip[k] = r[k]
+            prod = None
+            for k in filter(None, (key(r.get("item_code")), key(r.get("item_name") or r.get("name")))):
+                prod = (self.products or {}).get(k)
+                if prod:
+                    break
+            name = r.get("item_name") or r.get("name") or (prod or {}).get("item_name")
+            code = r.get("item_code") or (prod or {}).get("item_code")
+            qty, price = r.get("purchase_qty"), r.get("purchase_price")
+            amount = r.get("purchase_line_amount")
+            if amount is None and qty is not None and price is not None:
+                amount = qty * price
+            base = r.get("purchase_base_qty")
+            if base is None and qty is not None:
+                base = qty * self._factor(code, name, r.get("unit_purchase"))
+            slip["lines"].append(
+                {
+                    "purchase_id": pid,
+                    "item_code": code,
+                    "item_name": name,
+                    "unit": r.get("unit_purchase"),
+                    "qty": qty,
+                    "price": price,
+                    "amount": amount,
+                    "base_qty": base,
+                    "batch_id": r.get("batch_id"),
+                    "expiry": r.get("expiry"),
+                }
+            )
+        records = []
+        for slip in slips.values():
+            day = slip.get("purchase_date")
+            slip["day"] = day.date() if isinstance(day, dt.datetime) else day
+            slip["cancelled"] = normalize_status(slip.get("purchase_status")) == "cancelled"
+            amounts = [ln["amount"] for ln in slip["lines"] if ln["amount"] is not None]
+            if slip.get("purchase_total") is None and amounts:
+                slip["purchase_total"] = sum(amounts, Decimal(0))
+            for ln in slip["lines"]:
+                ln.update(day=slip["day"], cancelled=slip["cancelled"], supplier=slip.get("supplier"))
+                records.append(ln)
+        self.purchase_slips = slips
+        self.purchases = records
+        self.batches = batches
+
+    def _build_stock(self, specs):
+        """Closing stock per item in base units, as the stock report gives it
+        for the last day of data. A stock ledger (one row per movement) keeps
+        the last row of each item."""
+        if not specs:
+            return
+        stock = {}
+        for spec in specs:
+            for r in self.typed(self.read_spec(spec), spec):
+                if r.get("stock_qty") is None:
+                    continue
+                for k in filter(None, (key(r.get("item_code")), key(r.get("item_name") or r.get("name")))):
+                    stock[k] = r["stock_qty"]
+        self.stock = stock
+
+    def _build_payments(self, specs):
+        """Payments received for orders (§4): one record per payment."""
+        if not specs:
+            return
+        out = []
+        for spec in specs:
+            for r in self.typed(self.read_spec(spec), spec):
+                when = r.get("pay_time")
+                if r.get("order_id") is None or r.get("pay_amount") is None:
+                    continue
+                out.append(
+                    {
+                        "order_id": r["order_id"],
+                        "day": when.date() if isinstance(when, dt.datetime) else when,
+                        "amount": r["pay_amount"],
+                        "method": r.get("payment_method"),
+                        "note": r.get("note"),
+                    }
+                )
+        self.payments = out
 
     def _build_customers(self, specs):
         customers = {}
@@ -550,6 +699,20 @@ class Shop:
                         return factor
         return Decimal(1)
 
+    def _base_unit(self, r):
+        """Base unit of the line's item: the catalog's, else the conversion
+        table's, else the line's own unit when it has no conversion (§10)."""
+        if r.get("unit_base"):
+            return r["unit_base"]
+        unit = r.get("unit")
+        if unit is None:
+            return None
+        for k in filter(None, (key(r.get("item_code")), key(r.get("item_name")))):
+            hit = self.conversions.get((k, key(unit)))
+            if hit:
+                return hit[1]
+        return unit
+
     def _assemble(self, line_rows, order_rows):
         line_rows = self._fill_down(line_rows)
         order_rows = self._fill_down(order_rows)
@@ -621,6 +784,7 @@ class Shop:
                 r["line_amount"] = r["qty"] * r["unit_price"] - (r.get("line_discount") or 0)
             if r.get("base_qty") is None and r.get("qty") is not None:
                 r["base_qty"] = r["qty"] * self._factor(r.get("item_code"), r.get("item_name"), r.get("unit"))
+            r["base_unit"] = self._base_unit(r)
             day_value = r.get("date") or r.get("datetime")
             r["day"] = day_value.date() if isinstance(day_value, dt.datetime) else day_value
             ts = r.get("datetime")

@@ -9,7 +9,7 @@ from .tools import TOOL_HELP, Tools, encode
 
 # Bump when prompts, tools or loop rules change, so runs from different harness
 # versions are never resumed into each other or compared by accident.
-HARNESS_VERSION = "h6"
+HARNESS_VERSION = "h7"
 
 SYSTEM = """You answer Vietnamese business questions using the supplied business files.
 Treat as_of_date as today. The rulebook and the business README define how to read the data

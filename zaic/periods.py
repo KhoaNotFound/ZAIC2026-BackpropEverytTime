@@ -7,6 +7,7 @@ beginning of the data" (stock / debt questions "đến hết ngày X").
 import csv
 import datetime as dt
 import re
+import unicodedata
 from dataclasses import dataclass
 from functools import lru_cache
 
@@ -38,13 +39,64 @@ def untelex(word):
     return fixed if SYLLABLE.match(fixed) else word
 
 
+# Chat spellings ("teencode") and dialect forms of common question words.
+CHAT_SPELLINGS = [
+    (r"\bmik\b|\bmk\b|\bmjk\b|\bmih\b", "minh"),
+    (r"\bwan\b|\bqan\b", "quan"),
+    (r"\bnhut\b|\bnhit\b", "nhat"),
+    (r"\btrog\b|\btrg\b|\btrong\b", "trong"),
+    (r"\bkua\b", "cua"),
+    (r"\bjum\b|\bzum\b|\bdum\b|\bgjum\b", "gium"),
+    (r"\bkon\b", "con"),
+    (r"\btih\b", "tinh"),
+    (r"\bcko\b", "cho"),
+    (r"\bbit\b|\bbik\b|\bbjt\b", "biet"),
+    (r"\bmun\b", "muon"),
+    (r"\bnhug\b|\bnhg\b", "nhung"),
+    (r"\bngui\b|\bnguoj\b", "nguoi"),
+    (r"\btug\b", "tung"),
+    (r"\bhk\b|\bhem\b|\bhog\b|\bkhg\b|\bhok\b", "khong"),
+    (r"\bdx\b", "duoc"),
+    (r"\bzo\b", "vao"),
+    (r"\bkac\b", "cac"),
+    (r"\bxau\b", "sau"),
+    (r"\bth (nay|truoc|roi)\b", r"thang \1"),
+    (r"\b(ngay|thang|khach|mon|hang|nhom|kenh|tuan) mo\b", r"\1 nao"),
+    (r"\bmi (?=%|phan tram)", "may "),
+    (r"\bnam trong\b", "co mat trong"),
+]
+
+
+def prefold(text):
+    """Accent-free lower-case text, before typo repair; entity names are matched
+    on this form so product names are never 'repaired'."""
+    # "nhiêu" alone is "bao nhiêu" (how many); after folding it would read as
+    # "nhiều" (many), so expand it while the accents are still there.
+    return fold(accented(text))
+
+
+def accented(text):
+    """Lower-case question text with its accents, cleaned the same way as
+    `prefold`, so both strings line up character by character."""
+    text = unicodedata.normalize("NFC", str(text)).lower()
+    text = re.sub(r"(?<!bao )\bnhiêu\b", "bao nhiêu", text)
+    # Sentence particles that fold into content words ("thế" vs "thẻ", "rứa" vs "rửa").
+    text = re.sub(r"\b(?:thế|rứa|hè|hỉ|nà|nì)\b", " ", text)
+    return re.sub(r"\s+", " ", text).strip()
+
+
 def normalize_question(text):
     """Folded, typo-tolerant form used for intent and period matching."""
-    text = fold(text)
+    return normalize_folded(prefold(text))
+
+
+def normalize_folded(text):
     text = re.sub(r"[?!.,;:\"“”()]+(?=\s|$)", " ", text)
     text = re.sub(r"[a-z]+", lambda m: untelex(m.group()), text)
     replacements = [
-        (r"\bdthu\b|\bdoanh so\b", "doanh thu"),
+        *CHAT_SPELLINGS,
+        (r"\bdthu\b|\bdoanh so\b|\brevenue\b", "doanh thu"),
+        (r"\bhoom\b", "hom"),
         (r"\bhnay\b|\bbua nay\b|\bbua ni\b|\bhom ni\b|\bhom nay\b", "hom nay"),
         (r"\bhqua\b|\bbua qua\b|\bhom qua\b|\bbua hom qua\b", "hom qua"),
         (r"\bthang ni\b", "thang nay"),
@@ -53,11 +105,16 @@ def normalize_question(text):
         (r"\btrc\b", "truoc"),
         (r"\bvs\b", "voi"),
         (r"\bdc\b|\bdk\b", "duoc"),
+        # "nhìu ... nhất" is "nhiều ... nhất" (most); any other "nhiu" asks how many.
+        (r"\b(?:nhiu|nhju)\b(?=(?: \w+){0,2} nhat\b)", "nhieu"),
         (r"\bbn\b|\bbnhiu\b|\bbnhieu\b|\bbao nhiu\b|\bnhiu\b", "bao nhieu"),
         (r"\bsl\b", "so luong"),
         (r"\bsp\b", "san pham"),
         (r"\bdh\b", "don hang"),
         (r"\bko\b|\bkh\b", "khong"),
+        (r"\bbill\b|\border\b|\bhoa don\b|\bbills\b|\borders\b", "don"),
+        (r"\btotal\b", "tong cong"),
+        (r"\bbest ?sellers?\b", "ban chay nhat"),
     ]
     for pattern, repl in replacements:
         text = re.sub(pattern, repl, text)
@@ -150,6 +207,8 @@ def resolve_quarter(q, today):
 
 def previous_period(p, today=None):
     """The period right before `p`, as used for 'so với kỳ trước'."""
+    if p.start is None:
+        return None
     if p.kind == "month":
         prev = p.start - dt.timedelta(days=1)
         return month(prev.year, prev.month)
@@ -238,11 +297,11 @@ def find_periods(q, today, calendar_path=None):
         if period is not None:
             found.append(Mention(period, m.span(group), m.group(group)))
 
-    for m in re.finditer(r"tu dau thang nay(?: (?:den|toi) (?:het )?(?:ngay )?hom nay)?", q):
+    for m in re.finditer(r"tu (?:dau thang|mung 1|mong 1)(?: nay)?(?: (?:den|toi) (?:het )?(?:ngay )?hom nay)?", q):
         add(m, this_month(today))
     for m in re.finditer(r"cung ky thang truoc", q):
         add(m, previous_month_same_days(today))
-    for m in re.finditer(r"tu (?:ngay )?(?:dau nam|01?/01?)(?: nay)?(?: (?:den|toi) (?:het )?(?:ngay )?hom nay)?", q):
+    for m in re.finditer(r"tu (?:ngay )?(?:dau nam|0?1/0?1(?![\d/]))(?: nam)?(?: nay)?(?: (?:den|toi) (?:het )?(?:ngay )?hom nay)?", q):
         add(m, year_to_date(today))
     for m in re.finditer(r"\btu (?:ngay )?" + DATE_RE + r" (?:den|toi) (?:het )?(?:ngay )?" + DATE_RE, q):
         g = m.groups()
@@ -275,6 +334,23 @@ def find_periods(q, today, calendar_path=None):
             add(m, month(_year(m.group(2)), int(m.group(1))))
         except ValueError:
             pass
+    # Bare "11-2025", "07/2025", "3/26": month and year (a two-digit second
+    # number above 12 cannot be a month, so it is a year).
+    for m in re.finditer(r"(?<![\d/.\-])(\d{1,2})\s?[/\-]\s?(\d{4}|\d{2})(?![\d/.\-])", q):
+        mon, year = int(m.group(1)), m.group(2)
+        if 1 <= mon <= 12 and (len(year) == 4 or int(year) > 12):
+            add(m, month(_year(year), mon))
+    # "th7 th8 th9/2025", "tháng 3, 4 và 5/2026": earlier months take the year of the last one.
+    for m in re.finditer(r"((?:(?:thang |th|t)?\d{1,2}(?:, | va | voi | den | toi | ))+)(?:thang |th|t)?(\d{1,2})\s?[/\-]\s?(\d{4}|\d{2})\b", q):
+        if not re.match(r"thang |th|t\d", m.group(1)):
+            continue
+        for part in re.finditer(r"(?:thang |th|t)?(\d{1,2})(?=, | va | voi | den | toi | )", m.group(1)):
+            mon = int(part.group(1))
+            if 1 <= mon <= 12:
+                found.append(Mention(month(_year(m.group(3)), mon), (m.start(1) + part.start(), m.start(1) + part.end()), part.group(0)))
+    for m in re.finditer(r"\bth(\d{1,2})\b(?!\s*[/\-])", q):
+        if 1 <= int(m.group(1)) <= 12:
+            add(m, resolve_month(int(m.group(1)), today))
     for m in re.finditer(r"\bth?\s*(\d{1,2})/(\d{2}|\d{4})\b", q):
         try:
             add(m, month(_year(m.group(2)), int(m.group(1))))
@@ -314,7 +390,7 @@ def find_periods(q, today, calendar_path=None):
     for m in re.finditer(r"\bnam (\d{4})\b", q):
         add(m, year_period(int(m.group(1))))
     if calendar_path:
-        for m in re.finditer(r"\btet(?: am lich| nguyen dan)?(?: nam)? (\d{4}|nay|ngoai|truoc)\b|\b(?:dip|mua) tet\b", q):
+        for m in re.finditer(r"\b(?:dip |mua )?tet(?: am lich| nguyen dan)?(?:(?: nam)? (\d{4}|nay|ngoai|truoc)\b)?", q):
             word = m.group(1)
             if word is None or word == "nay":
                 y = today.year
