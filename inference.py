@@ -152,6 +152,12 @@ def parser():
         "continue later with --resume. Use it to stay under Kaggle's 12-hour commit limit.",
     )
     p.add_argument(
+        "--no-semantic",
+        dest="semantic",
+        action="store_false",
+        help="Skip the semantic layer (rule parser + metrics) and send every question to the agent",
+    )
+    p.add_argument(
         "--evaluate", action="store_true",
         help="After inference, compare saved predictions with this split's answers.jsonl",
     )
@@ -266,57 +272,82 @@ def main():
         if args.evaluate:
             evaluate_output(args)
         return
-    from zaic.agent import answer_question
-    from zaic.model import HFBackend
-
-    load_start = time.perf_counter()
-    backend = HFBackend(
-        args.model,
-        args.quantization,
-        args.device_map,
-        args.context_tokens,
-        args.max_new_tokens,
-        args.thinking,
-        args.gpu_memory_gib,
-        args.prefill_chunk_size,
-        args.temperature,
-        args.top_p,
-        args.top_k,
-        args.repetition_penalty,
-        args.prefix_cache,
-    )
-    import importlib.metadata
-
-    versions = {
-        pkg: importlib.metadata.version(pkg)
-        for pkg in [
-            "torch",
-            "transformers",
-            "accelerate",
-            "bitsandbytes",
-            "pandas",
-            "duckdb",
-            "openpyxl",
-        ]
-    }
-    meta = {
-        "config": config,
-        "versions": versions,
-        "load_seconds": time.perf_counter() - load_start,
-        "device_map": backend.device_map,
-        "quantization_loaded": getattr(backend, "quantization", None),
-        # Present when --model is a directory saved by scripts/prepare_model.py.
-        "model_source": (
-            json.loads((Path(args.model) / "zaic_model.json").read_text())
-            if (Path(args.model) / "zaic_model.json").is_file()
-            else None
-        ),
-        "note": "Inference only; no training loss or weight updates.",
-    }
-    meta_path.write_text(json.dumps(meta, ensure_ascii=False, indent=2) + "\n")
     times, errors = [], 0
     stopped_on_error = False
     stopped_on_time = False
+    load_start = time.perf_counter()
+    semantic = {}
+    if args.semantic:
+        from zaic.router import semantic_answers
+
+        semantic = semantic_answers(args.data_dir, pending)
+        print(f"semantic layer answered {len(semantic)}/{len(pending)} questions", flush=True)
+        with (
+            args.output.open("a", encoding="utf-8") as out,
+            trace_path.open("a", encoding="utf-8") as traces,
+            metrics_path.open("a", encoding="utf-8") as metrics,
+        ):
+            for q in pending:
+                if q["id"] not in semantic:
+                    continue
+                prediction, detail = semantic[q["id"]]
+                times.append(detail["elapsed_seconds"])
+                traces.write(json.dumps(detail, ensure_ascii=False) + "\n")
+                metrics.write(json.dumps({k: v for k, v in detail.items() if k != "trace"}, ensure_ascii=False) + "\n")
+                out.write(json.dumps(prediction, ensure_ascii=False, allow_nan=False) + "\n")
+            out.flush()
+        pending = [q for q in pending if q["id"] not in semantic]
+    if not pending:
+        meta_path.write_text(json.dumps({"config": config, "note": "semantic layer only; model not loaded"}, ensure_ascii=False, indent=2) + "\n")
+    else:
+        from zaic.agent import answer_question
+        from zaic.model import HFBackend
+
+        model_start = time.perf_counter()
+        backend = HFBackend(
+            args.model,
+            args.quantization,
+            args.device_map,
+            args.context_tokens,
+            args.max_new_tokens,
+            args.thinking,
+            args.gpu_memory_gib,
+            args.prefill_chunk_size,
+            args.temperature,
+            args.top_p,
+            args.top_k,
+            args.repetition_penalty,
+            args.prefix_cache,
+        )
+        import importlib.metadata
+
+        versions = {
+            pkg: importlib.metadata.version(pkg)
+            for pkg in [
+                "torch",
+                "transformers",
+                "accelerate",
+                "bitsandbytes",
+                "pandas",
+                "duckdb",
+                "openpyxl",
+            ]
+        }
+        meta = {
+            "config": config,
+            "versions": versions,
+            "load_seconds": time.perf_counter() - model_start,
+            "device_map": backend.device_map,
+            "quantization_loaded": getattr(backend, "quantization", None),
+            # Present when --model is a directory saved by scripts/prepare_model.py.
+            "model_source": (
+                json.loads((Path(args.model) / "zaic_model.json").read_text())
+                if (Path(args.model) / "zaic_model.json").is_file()
+                else None
+            ),
+            "note": "Inference only; no training loss or weight updates.",
+        }
+        meta_path.write_text(json.dumps(meta, ensure_ascii=False, indent=2) + "\n")
     with (
         args.output.open("a", encoding="utf-8") as out,
         trace_path.open("a", encoding="utf-8") as traces,
@@ -371,7 +402,8 @@ def main():
         "median_seconds": statistics.median(times) if times else None,
         "stopped_on_error": stopped_on_error,
         "stopped_on_time_budget": stopped_on_time,
-        "selected_but_not_completed": len(pending) - len(times),
+        "answered_by_semantic_layer": len(semantic),
+        "selected_but_not_completed": len(pending) + len(semantic) - len(times),
         # Stalled/max_steps questions are normal outcomes and count toward the
         # estimate; only a runtime error (which stops the run) disables it.
         "estimated_3000_questions_hours": (
