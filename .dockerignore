@@ -1,0 +1,13 @@
+.git
+data
+outputs
+reports
+notebooks
+__pycache__
+**/__pycache__
+*.log
+*.txt
+!requirements-docker.txt
+*.jsonl
+*.tar
+*.tar.gz
