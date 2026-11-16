@@ -98,6 +98,20 @@ def shorten(text, limit):
     return text[:limit] + f" ...[{len(text) - limit} more characters omitted]"
 
 
+def coerce_final(candidate):
+    """A count or amount sent as a numeric string is a number (§9 formats)."""
+    value = candidate.get("answer")
+    if candidate.get("type") == "string" and isinstance(value, str) and re.fullmatch(r"-?\d+(\.\d+)?", value.strip()):
+        number = float(value)
+        return {**candidate, "type": "number", "answer": int(number) if number.is_integer() else number}
+    return candidate
+
+
+def from_nothing(candidate):
+    kind, value = candidate.get("type"), candidate.get("answer")
+    return kind == "unanswerable" or (kind in ("number", "percent") and value == 0)
+
+
 def final_problem(candidate, has_evidence):
     kind = candidate.get("type")
     if kind not in FINAL_FORMATS:
@@ -234,6 +248,8 @@ def answer_question(backend, split_dir, question, max_steps=16, tool_chars=10000
     tools = Tools(split_dir, question["business_id"])
     trace, usages = [], []
     last_key, same_count, has_evidence = None, 0, False
+    # The last query result was empty / all NULL or 0, or the last tool failed.
+    unreliable_last, unreliable_rejections = False, 0
     status, error, error_traceback = "ok", None, None
     prediction = {"id": question["id"], "type": "abstain"}
     try:
@@ -323,8 +339,20 @@ def answer_question(backend, split_dir, question, max_steps=16, tool_chars=10000
                         "another tool."
                     )
                 elif action["action"] == "final":
-                    candidate = {k: v for k, v in action.items() if k != "action"}
+                    candidate = coerce_final({k: v for k, v in action.items() if k != "action"})
                     problem = final_problem(candidate, has_evidence)
+                    if problem is None and unreliable_last and from_nothing(candidate):
+                        # 0 or "unanswerable" right after an empty result or a failed
+                        # tool is a broken filter far more often than a fact.
+                        unreliable_rejections += 1
+                        if unreliable_rejections >= 2:
+                            prediction = {"id": question["id"], "type": "abstain"}
+                            break
+                        problem = (
+                            "your last tool call failed or returned nothing, so this answer is "
+                            "not supported by data. Fix the query (check the filtered values with "
+                            'SELECT DISTINCT) and answer from a real result, or reply {"action":"final","type":"abstain"}.'
+                        )
                     if problem is None:
                         prediction = {"id": question["id"], **candidate}
                         break
@@ -337,6 +365,7 @@ def answer_question(backend, split_dir, question, max_steps=16, tool_chars=10000
                         result = tools.call(name, action["arguments"])
                     except Exception as exc:  # noqa: BLE001 -- tool failures are fed back to the model
                         event["tool_error"] = f"{type(exc).__name__}: {exc}"
+                        unreliable_last = True
                         feedback = tool_error_feedback(
                             name, exc, tools, file_paths, action["arguments"]
                         )
@@ -357,6 +386,7 @@ def answer_question(backend, split_dir, question, max_steps=16, tool_chars=10000
                         feedback = TOOL_RESULT_PREFIX + payload
                         if name in ("run_sql", "query_sqlite"):
                             warning = result_warning(result)
+                            unreliable_last = bool(warning)
                             if warning:
                                 event["result_warning"] = True
                                 feedback += warning

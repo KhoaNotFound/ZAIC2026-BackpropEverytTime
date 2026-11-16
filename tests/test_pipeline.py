@@ -801,6 +801,27 @@ def test_final_needs_data_evidence_not_only_listing(source):
     assert "a JSON number" in detail["trace"][2]["feedback"]
 
 
+def test_zero_or_unanswerable_after_an_empty_result_is_not_accepted(source):
+    load = '{"action":"load_table","path":"sales.csv","name":"s"}'
+    empty = '{"action":"run_sql","sql":"SELECT COUNT(*) AS n FROM s WHERE 1=0"}'
+    backend = ScriptedBackend(
+        [
+            load,
+            empty,
+            '{"action":"final","type":"number","answer":0}',
+            '{"action":"final","type":"unanswerable","reason":"no rows"}',
+        ]
+    )
+    prediction, detail = ask(backend, source)
+    assert prediction == {"id": prediction["id"], "type": "abstain"}
+    assert "not supported by data" in detail["trace"][2]["feedback"]
+    # After a real result the same answer types are accepted, and "3" is a number.
+    real = '{"action":"run_sql","sql":"SELECT COUNT(*) AS n FROM s"}'
+    backend = ScriptedBackend([load, real, '{"action":"final","type":"string","answer":"3"}'])
+    prediction, _ = ask(backend, source)
+    assert (prediction["type"], prediction["answer"]) == ("number", 3)
+
+
 def test_invalid_long_reply_is_shortened_in_history(source):
     junk = "{" + " OR x" * 2000
     backend = ScriptedBackend([junk, '{"action":"final","type":"abstain"}'])
